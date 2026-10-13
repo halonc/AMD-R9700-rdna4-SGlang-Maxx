@@ -1,0 +1,126 @@
+# SGLang v0.5.20 (RDNA4 fork) serving Qwen3.8-27B AWQ->MXFP4 + DFlash2 on one R9700 32G.
+#
+# Prerequisites (see ../docs/DEPENDENCIES.md):
+#   1. SGLang v0.5.20 + the 72-patch community RDNA4 set, built into the image
+#      (Dockerfile).
+#   2. The 5 patches from ../patches/sglang/ applied to the fork (Dockerfile does it).
+#   3. The 20-line libr4d patch applied + r4d.so built (Dockerfile does it).
+#   4. radiance_mxfp4_fp8.so (third-party, NOT in this repo) — mount it in at
+#      /opt/radiance/radiance_mxfp4_fp8.so. Without it, the headline TG is ~24-32%
+#      lower (Open config path).
+#   5. The model weights: host /data mounted read-only; the converter
+#      (convert-awq-to-mxfp4.py) has already produced the MXFP4 checkpoint.
+#
+# The host /data mount keeps the production layout (models live on the NAS,
+# accessed via a local /data symlink). Adjust the source path to your setup.
+
+services:
+  sglang:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: r9700-sglang:latest
+    container_name: sglang-r9700
+    restart: unless-stopped
+
+    ports:
+      - "8081:8081"
+
+    # GPU passthrough (single R9700 on /dev/dri/card1 in the production setup;
+    # adjust card index if yours differs).
+    devices:
+      - /dev/kfd
+      - /dev/dri
+
+    # ROCm sees exactly one GPU. NOTE: these must be set to a real value,
+    # never to an empty string (an empty ROCR_/HIP_ list is read as "zero
+    # GPUs" and the server dies at startup).
+    environment:
+      - HIP_VISIBLE_DEVICES=0
+      - ROCR_VISIBLE_DEVICES=0
+      - PYTHONPATH=/opt/libr4d
+      - SGLANG_DIR=/opt/sglang
+      - ROCM_PATH=/opt/rocm
+      - TVM_FFI_GPU_BACKEND=cuda
+      - SGLANG_ENABLE_SPEC_V2=0
+      - SGLANG_VLM_CACHE_SIZE_MB=0
+      # --- finalized tuning env (kill-switches; see ../patches/PATCHSET.md) ---
+      - RADIANCE_MXFP4_WPERM=1
+      - SGLANG_EMBED_FP8=1
+      - SGLANG_RDNA4_DISABLE_STORE_CACHE=1
+      - SGLANG_R4D_ATTN=1
+      - SGLANG_MXFP4_DRAFT=0
+      - SGLANG_VERIFY_BLOCK_N=64
+      - SGLANG_MXFP4_ATILED_MIN_M=513
+      - SGLANG_R4D_GDN_MIN_T=513
+
+    # Host /data (models) read-only; the radiance .so (third-party) mounted in.
+    volumes:
+      - /data:/data:ro
+      - ./radiance/radiance_mxfp4_fp8.so:/opt/radiance/radiance_mxfp4_fp8.so:ro
+
+    shm_size: "16gb"
+
+    # The finalized launch configuration (see launch.env for the values).
+    command:
+      - python
+      - -m
+      - sglang.launch_server
+      - --model-path
+      - /data/models_sglang/qwen38-mxfp4
+      - --tensor-parallel-size
+      - "1"
+      - --dtype
+      - bfloat16
+      - --kv-cache-dtype
+      - fp8_e4m3
+      - --context-length
+      - "182000"
+      - --mem-fraction-static
+      - "0.94"
+      - --max-running-requests
+      - "1"
+      - --chunked-prefill-size
+      - "2048"
+      - --num-continuous-decode-steps
+      - "8"
+      - --attention-backend
+      - triton
+      - --pre-warm-nccl
+      - --watchdog-timeout
+      - "300"
+      - --port
+      - "8081"
+      - --host
+      - 0.0.0.0
+      - --quantization
+      - r4d_mxfp4
+      - --max-mamba-cache-size
+      - "16"
+      - --reasoning-parser
+      - qwen3
+      - --trust-remote-code
+      - --cuda-graph-max-bs-decode
+      - "4"
+      - --speculative-algorithm
+      - DFLASH
+      - --speculative-draft-model-path
+      - /data/models_sglang/qwen38-dflash2
+      - --mamba-full-memory-ratio
+      - "0.12"
+      - --mamba-radix-cache-strategy
+      - extra_buffer
+      - --page-size
+      - "16"
+      - --served-model-name
+      - Qwen3.8-27B-MXFP4-DFlash2
+      - --tool-call-parser
+      - qwen3_coder
+      - --image-processor-backend
+      - pil
+      - --sleep-on-idle
+      - --enable-cache-report
+      - --radix-eviction-policy
+      - slru
+      - --mamba-ssm-dtype
+      - float32

@@ -1,0 +1,80 @@
+diff --git a/r4d.h b/r4d.h
+index 7addfcd..f17a770 100644
+--- a/r4d.h
++++ b/r4d.h
+@@ -55,6 +55,10 @@ struct R4DArgs {
+     float scale;
+     int  splits;                // decode only; 0 = let the split law choose
+     int  max_ctx;               // host-visible context bound (seqused_k is device-side)
++    // SGLang-style cache: K and V live in SEPARATE buffers, each
++    // (num_blocks, block_size, kv_heads, head_dim) -- token-major inside a
++    // block, no K|V interleave. Null = the interleaved layout above.
++    const void* v;
+ };
+ 
+ extern "C" {
+diff --git a/r4d_attn_decode_h256_gqa6.hip b/r4d_attn_decode_h256_gqa6.hip
+index 1e88bd3..5294faf 100644
+--- a/r4d_attn_decode_h256_gqa6.hip
++++ b/r4d_attn_decode_h256_gqa6.hip
+@@ -103,6 +103,13 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
+     const int qhead = kvh * GQA + hi;
+ 
+     const int* __restrict__ bt = a.block_table + (size_t)seq * a.max_blocks;
++    // SGLang cache layout: separate V buffer, token-major slot of kv_heads*head_dim
++    // elements (no K|V interleave). SLOT is the per-token stride; VOFF the K->V shift
++    // inside a slot for the interleaved layout.
++    const bool     SGL  = (a.v != nullptr);
++    const size_t   SLOT = SGL ? (size_t)a.kv_head_stride * a.kv_heads : (size_t)(2 * HEAD_DIM);
++    const size_t   VOFF = SGL ? 0 : (size_t)HEAD_DIM;
++    const void*    VBASE = SGL ? a.v : a.kv;
+     const float kdesc = a.k_descale ? a.k_descale[seq * a.kv_heads + kvh] : 1.0f;
+     const float mul   = a.scale * kdesc * 1.44269504089f;
+ 
+@@ -144,9 +151,9 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
+                 const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
+                 const size_t o = (size_t)blk * a.kv_block_stride
+                                + (size_t)kvh * a.kv_head_stride
+-                               + (size_t)(kk % BS) * (2 * HEAD_DIM) + HEAD_DIM + d0;
+-                const void* p = KVP ? (const void*)((const uint16_t*)a.kv + o)
+-                                    : (const void*)((const uint8_t*)a.kv + o);
++                               + (size_t)(kk % BS) * SLOT + VOFF + d0;
++                const void* p = KVP ? (const void*)((const uint16_t*)VBASE + o)
++                                    : (const void*)((const uint8_t*)VBASE + o);
+                 vreg[r] = __builtin_bit_cast(uint4, load_tr_b128(p));
+             }
+         }
+@@ -206,7 +213,7 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
+                 const int kk = min(k0 + key, ctx - 1);
+                 const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
+                 const size_t o = (size_t)kb * a.kv_block_stride
+-                               + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * (2 * HEAD_DIM);
++                               + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * SLOT;
+                 uint16_t* kd = &sK[key * KSTR];
+                 uint32_t w4[4];
+                 if (KVP) {
+@@ -232,7 +239,7 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
+                 const int kk = min(k0 + mt * 16 + c, ctx - 1);
+                 const int kb = BTS ? blk[(kk - k0) / BS] : bt[kk / BS];
+                 grow = (const uint8_t*)a.kv + ((size_t)kb * a.kv_block_stride
+-                     + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * (2 * HEAD_DIM))
++                     + (size_t)kvh * a.kv_head_stride + (size_t)(kk % BS) * SLOT)
+                      * (KVP ? 2 : 1);
+             }
+             v8f s = (v8f){0,0,0,0,0,0,0,0};
+diff --git a/r4d_common.h b/r4d_common.h
+index e2e477a..c3bf7d2 100644
+--- a/r4d_common.h
++++ b/r4d_common.h
+@@ -47,7 +47,10 @@ __device__ __forceinline__ float swap16(float x) {
+ // 8x8 transpose of 16-bit elements across each group of 8 lanes. Lane j receives element j from
+ // each of the 8 lanes in its group; the 8 addresses may be arbitrarily strided.
+ __device__ __forceinline__ v8s load_tr_b128(const void* p) {
+-    return __builtin_amdgcn_global_load_tr_b128_v8i16((v8s*)const_cast<void*>(p));
++    // ROCm 7.2.4 clang requires the explicit global address space here.
++    using r4d_gptr_t = v8s __attribute__((address_space(1))) *;
++    return __builtin_amdgcn_global_load_tr_b128_v8i16(
++        (r4d_gptr_t)const_cast<void*>(p));
+ }
+ 
+ // Gather the low (sel=0) or high (sel=1) byte of each of four 16-bit lanes of {w0,w1} into one

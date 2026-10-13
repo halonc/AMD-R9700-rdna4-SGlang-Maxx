@@ -1,0 +1,533 @@
+--- 001-r4d-mxfp4-core ---
+diff --git a/python/sglang/srt/hardware_backend/gpu/quantization/r4d_mxfp4.py b/python/sglang/srt/hardware_backend/gpu/quantization/r4d_mxfp4.py
+new file mode 100644
+index 0000000..a4362df
+--- /dev/null
++++ b/python/sglang/srt/hardware_backend/gpu/quantization/r4d_mxfp4.py
+@@ -0,0 +1,386 @@
++"""Dense MXFP4 (E2M1 weights + UE8M0 g32 scales) GEMM via the radiance RDNA4 kernels.
++
++Two bands, because the author's own dispatch says so: the hand-written fp8-WMMA "folded"
++kernel only wins above M~256, while libr4d's r4d_gemm_mxfp4a8_nt_m64 is 2.2-4.7x faster in
++the decode/verify band (M<=64).  Measured here on a 5120x17408 layer:
++    M=1 0.069ms vs 0.283ms | M=8 0.060 vs 0.285 | M=64 0.125 vs 0.273 | M=2048 2.039ms
++
++Both kernels read the weight in WMMA FRAGMENT ORDER (RADIANCE_MXFP4_WPERM): the r4d kernel
++has no LDS staging to hide a strided read, so the permutation is what makes it fast.  It is
++a byte permutation, not a re-quantisation - numerics are unchanged (verified 11.2% vs the
++dense AWQ weight in BOTH bands, i.e. pure requantisation error).
++
++Weight layout (after fragment_order):
++    weight  [N, K/2] uint8   (two e2m1 codes per byte, low nibble = even k)
++    scale   [K/32, N] uint8  (E8M0, value = 2**(b-127))
++    row_ref [N] uint8        (folded-path per-row reference exponent)
++"""
++import os, sys, torch
++
++# Must be in place before radiance_mxfp4_fp8 is imported: the HIP kernels take the flag from
++# the environment, and it has to agree with whether we permuted the weights.
++os.environ.setdefault("RADIANCE_MXFP4_WPERM", "1")
++# radiance's internal decode-tuned path inside launch(): measured on M=8 verify shapes,
++# KS=8/NT=0/EPIFAST=1 beats libr4d m64 by +24~32% on K=17408 and N=5120 shapes, ties on
++# 17408x5120, and collapses above the split-K scratch cap (dec_max_n=36864) -> hybrid.
++RAD_DECODE = os.environ.get("SGLANG_MXFP4_RADIANCE_DECODE", "1") == "1"
++os.environ.setdefault("RADIANCE_MXFP4_DECODE_MAX_M", "64")
++os.environ.setdefault("RADIANCE_MXFP4_DECODE_NT", "0")
++os.environ.setdefault("RADIANCE_MXFP4_EPIFAST", "1")
++os.environ.setdefault("RADIANCE_MXFP4_DECODE_KS", "8")
++DEC_MAX_N = 36864
++WPERM = os.environ.get("RADIANCE_MXFP4_WPERM", "0") == "1"
++R4D_DECODE_MAX_M = int(os.environ.get("SGLANG_MXFP4_R4D_DECODE_MAX_M", "64"))
++
++_EXT = None
++_KERNEL_DIR = os.environ.get("R4D_MXFP4_DIR", "/opt/mxfp4")
++_R4D = [None]
++_R4D_TRIED = [False]
++
++
++def _ext():
++    global _EXT
++    if _EXT is None:
++        if _KERNEL_DIR not in sys.path:
++            sys.path.insert(0, _KERNEL_DIR)
++        import radiance_mxfp4_fp8 as m
++        _EXT = m
++    return _EXT
++
++
++def _r4d():
++    """libr4d's MXFP4 GEMM, or None when this build has no mxfp4a8 kernel."""
++    if not _R4D_TRIED[0]:
++        _R4D_TRIED[0] = True
++        try:
++            import r4d as m
++            _R4D[0] = m if m.select("gemm_nt", M=8, K=5120, N=5120, dtype="mxfp4a8") else None
++        except Exception:
++            _R4D[0] = None
++    return _R4D[0]
++
++
++_DEC = [None, None, False]
++
++
++def init_decode_scratch(device):
++    """split-K partials + block counter for the radiance decode kernel.
++    Must run at weight-load time: hipMalloc inside cuda-graph capture is illegal."""
++    if _DEC[2] or not RAD_DECODE:
++        return
++    try:
++        s0 = torch.empty(4 * 64 * DEC_MAX_N, dtype=torch.float32, device=device)
++        s1 = torch.zeros(DEC_MAX_N // 128 + 8, dtype=torch.int32, device=device)
++        _ext().set_decode_scratch(s0.data_ptr(), s0.numel() * 4, s1.data_ptr())
++        _DEC[0], _DEC[1], _DEC[2] = s0, s1, True
++        print("[r4d.mxfp4] radiance decode kernel ON (M<=64, N<=%d, KS=8, EPIFAST)"
++              % DEC_MAX_N, flush=True)
++    except Exception as e:
++        print("[r4d.mxfp4] decode scratch FAILED, staying on libr4d: %r" % (e,), flush=True)
++
++
++def fragment_order(packed: torch.Tensor, K: int) -> torch.Tensor:
++    """[N, K/2] uint8 checkpoint order -> WMMA fragment order (same shape).
++
++    Slot l of tile (nt, ks) is W[nt][l&15][ks][4*(l>>4) .. +4], i.e. a half-wave then reads
++    128 contiguous bytes instead of sixteen rows K/2 bytes apart.
++    """
++    N = packed.shape[0]
++    nt, ks = N // 16, K // 16
++    return (packed.view(nt, 16, ks, 2, 4)
++                  .permute(0, 2, 3, 1, 4)
++                  .contiguous()
++                  .view(N, K // 2))
++
++
++def checkpoint_order(packed: torch.Tensor, K: int) -> torch.Tensor:
++    """Inverse of fragment_order (for reference-side checks only)."""
++    N = packed.shape[0]
++    nt, ks = N // 16, K // 16
++    return (packed.view(nt, ks, 2, 16, 4)
++                  .permute(0, 3, 1, 2, 4)
++                  .contiguous()
++                  .view(N, K // 2))
++
++
++_FASTQ = os.environ.get("SGLANG_MXFP4_FASTQUANT", "1") == "1"
++
++
++def _quant(x: torch.Tensor):
++    """Per-token e4m3 quantisation.  The Triton one-pass kernel replaces five torch
++    kernels and two [M,K] fp32 temporaries; measured identical to within 5e-10 on the
++    scale and correct through the canary."""
++    if _FASTQ:
++        try:
++            return quant_act_fp8_fast(x)
++        except Exception:
++            pass
++    return quant_act_fp8(x)
++
++
++FUSED_NORM = os.environ.get("SGLANG_MXFP4_FUSED_NORM", "1") == "1"
++
++
++def fused_add_rms_quant(x: torch.Tensor, residual: torch.Tensor,
++                        w: torch.Tensor, eps: float):
++    """One kernel: residual-add + Gemma (1+w) RMSNorm + per-token e4m3 quant.
++    (q, s) follows the quant_act_fp8_fast contract: q [M,K] e4m3, s [M] fp32."""
++    M, K = x.shape
++    q = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
++    s = torch.empty(M, dtype=torch.float32, device=x.device)
++    res_out = torch.empty_like(residual)
++    _ext().launch_add_rms_quant(x.data_ptr(), residual.data_ptr(), w.data_ptr(),
++                                q.data_ptr(), s.data_ptr(), res_out.data_ptr(),
++                                M, K, eps, torch.cuda.current_stream().cuda_stream)
++    return q, s, res_out
++
++
++# Fragment-tiled A for the prefill GEMM (radiance_mxfp4_fp8_gemm_atiled): the fused-norm
++# producer emits the tiled layout at M >= this and mxfp4_linear_pq takes the A-direct
++# kernel -- measured 2026-10-07 on the real shapes: gate_up M=2048 3902->3070 us (+21.3%),
++# M=8192 +8.0%, bit-identical output (rel=0.0000). 0 = off: every band stays on the
++# row-major folded path, i.e. the pre-Phase-1 behaviour. The producer caps apply
++# (K <= 10240, 8-aligned); the decode band (M <= 64) stays row-major -- the decode kernel
++# reads row-major A. Producer -> consumer handoff is the data_ptr dict, popped on consume.
++ATILED_MIN_M = int(os.environ.get("SGLANG_MXFP4_ATILED_MIN_M", "0"))
++_ATILED: dict = {}
++_ATILED_STATS = [0]
++
++
++def atiled_wanted(M: int, K: int) -> bool:
++    return ATILED_MIN_M > 0 and M >= ATILED_MIN_M and 8 <= K <= 10240 and K % 32 == 0
++
++
++def fused_add_rms_quant_tiled(x: torch.Tensor, residual: torch.Tensor,
++                              w: torch.Tensor, eps: float):
++    """fused_add_rms_quant with the A output in the fragment-tiled layout: storage is
++    padded to 16 rows (the tiling writes whole fragments), q is the [M, K] VIEW, and the
++    pair is registered for the launch_at consumer."""
++    M, K = x.shape
++    q = torch.empty(((M + 15) // 16 * 16, K), dtype=torch.float8_e4m3fn, device=x.device)[:M]
++    s = torch.empty(M, dtype=torch.float32, device=x.device)
++    res_out = torch.empty_like(residual)
++    _ext().launch_add_rms_quant(x.data_ptr(), residual.data_ptr(), w.data_ptr(),
++                                q.data_ptr(), s.data_ptr(), res_out.data_ptr(),
++                                M, K, eps, torch.cuda.current_stream().cuda_stream, 1)
++    _ATILED[q.data_ptr()] = (M, K)
++    return q, s, res_out
++
++
++_GEMM_PROF = os.environ.get("SGLANG_MXFP4_GEMM_PROF") == "1"
++_GP = {"pairs": [], "n": 0, "steps": 16}
++
++
++def _gp_start():
++    if not _GEMM_PROF:
++        return None
++    e = torch.cuda.Event(enable_timing=True)
++    e.record()
++    return e
++
++
++def _gp_end(e0, N, K):
++    if e0 is None:
++        return
++    e1 = torch.cuda.Event(enable_timing=True)
++    e1.record()
++    _GP["pairs"].append((e0, e1, (N, K)))
++    _GP["n"] += 1
++    if _GP["n"] % 4096 == 0:
++        torch.cuda.synchronize()
++        acc = {}
++        for a, b, k in _GP["pairs"]:
++            acc[k] = acc.get(k, 0.0) + a.elapsed_time(b)
++        d = _GP["steps"]
++        tot = sum(acc.values()) / d
++        det = " ".join("N%dK%d=%.2f" % (k[0], k[1], v / d) for k, v in sorted(acc.items()))
++        print("[r4d.gemmprof] GEMM/step total=%.2f ms | %s" % (tot, det), flush=True)
++        _GP["pairs"] = []
++
++
++def mxfp4_linear_pq(xf: torch.Tensor, xs: torch.Tensor, w: torch.Tensor,
++                    ws: torch.Tensor, wref: torch.Tensor) -> torch.Tensor:
++    """mxfp4_linear with a pre-quantised (q, s) pair (fused norm epilogue)."""
++    M, K = xf.shape
++    N = w.shape[0]
++    out = torch.empty(M, N, dtype=torch.bfloat16, device=xf.device)
++    stream = torch.cuda.current_stream().cuda_stream
++    ent = _ATILED.pop(xf.data_ptr(), None)
++    if ent is not None:
++        # A lands here in the tiled layout only via fused_add_rms_quant_tiled; a mismatch
++        # means the handoff broke -- fail loud rather than read tiled A with the folded
++        # kernel (that would be silently wrong, not slow).
++        if ent != (M, K) or N % 16 or K % 32:
++            raise RuntimeError("r4d.mxfp4: atiled handoff mismatch %s vs %s (N=%d K=%d)"
++                               % (ent, (M, K), N, K))
++        _e = _gp_start()
++        _ext().launch_at(xf.data_ptr(), w.data_ptr(), ws.data_ptr(), wref.data_ptr(),
++                         xs.data_ptr(), out.data_ptr(), M, N, K, stream)
++        _gp_end(_e, N, K)
++        _ATILED_STATS[0] += 1
++        if _ATILED_STATS[0] in (1, 100, 1000, 10000, 100000):
++            print("[r4d.mxfp4] A-tiled GEMM path: call #%d (M=%d N=%d K=%d)"
++                  % (_ATILED_STATS[0], M, N, K), flush=True)
++        return out
++    if (RAD_DECODE and _DEC[2] and M <= R4D_DECODE_MAX_M and N <= DEC_MAX_N
++            and N % 16 == 0 and K % 32 == 0):
++        _e = _gp_start()
++        _ext().launch(xf.data_ptr(), w.data_ptr(), ws.data_ptr(), wref.data_ptr(),
++                      xs.data_ptr(), out.data_ptr(), M, N, K, stream)
++        _gp_end(_e, N, K)
++        return out
++    r4d = _r4d()
++    if (r4d is not None and M <= R4D_DECODE_MAX_M and N % 16 == 0 and K % 32 == 0):
++        wv, sk, mb, npw = _r4d_cfg(M, K)
++        r4d.gemm_mxfp4a8_nt_m64(xf.data_ptr(), xs.data_ptr(), w.data_ptr(),
++                                ws.data_ptr(), wref.data_ptr(), out.data_ptr(),
++                                M, K, N, wv, sk, mb, npw, stream)
++        return out
++    x = (xf.float() * xs.view(-1, 1)).to(torch.bfloat16)
++    return mxfp4_linear(x, w, ws, wref)
++
++
++CHUNK_ON = os.environ.get("SGLANG_MXFP4_CHUNK", "1") == "1"
++CHUNK_N = int(os.environ.get("SGLANG_MXFP4_CHUNK_N", "36864"))
++
++
++def plan_chunks(N: int):
++    # Measured on R9700: the radiance decode kernel does ~1050 GB/s at N=17408 but only
++    # ~510 GB/s at N=34816 (MLP gate_up) and 220 GB/s at N=248320 (lm_head).  Split the
++    # output dimension into equal 16-aligned pieces of at most CHUNK_N.
++    if not CHUNK_ON or N <= CHUNK_N:
++        return None
++    c = 2
++    while c <= 64:
++        if N % c == 0 and (N // c) % 16 == 0 and N // c <= CHUNK_N:
++            return [N // c] * c
++        c += 1
++    return None
++
++
++def build_chunks(pk, e8, ref):
++    # Pre-slice along N at load time.  pk is [N, K/2] row-major and every slice starts on
++    # a 16-row boundary, so the weight slices are contiguous views; e8 is [K/32, N], so its
++    # column slices are materialised copies (tiny: 40 MB for the whole lm_head).
++    N = pk.shape[0]
++    sizes = plan_chunks(N)
++    if sizes is None:
++        return None
++    ws_list, e8_list, ref_list = [], [], []
++    off = 0
++    for n in sizes:
++        ws_list.append(pk[off:off + n])
++        e8_list.append(e8[:, off:off + n].contiguous())
++        ref_list.append(ref[off:off + n].contiguous())
++        off += n
++    assert off == N
++    return ws_list, e8_list, ref_list
++
++
++def mxfp4_linear_pq_chunked(xf, xs, wc, wsc, refc, N):
++    # Decode/verify GEMM for a layer whose weights were pre-split along N.  The kernel
++    # writes a contiguous [M, n] tile, which is copied into the [M, N] output (0.3 MB at
++    # M=8, i.e. ~5 us, against the 90 us saved per layer).
++    M, K = xf.shape
++    out = torch.empty(M, N, dtype=torch.bfloat16, device=xf.device)
++    stream = torch.cuda.current_stream().cuda_stream
++    off = 0
++    for w, ws, ref in zip(wc, wsc, refc):
++        n = w.shape[0]
++        tmp = torch.empty(M, n, dtype=torch.bfloat16, device=xf.device)
++        _ext().launch(xf.data_ptr(), w.data_ptr(), ws.data_ptr(), ref.data_ptr(),
++                      xs.data_ptr(), tmp.data_ptr(), M, n, K, stream)
++        out[:, off:off + n].copy_(tmp, non_blocking=True)
++        off += n
++    return out
++
++
++
++def mxfp4_linear_chunked(x, wc, wsc, refc, N):
++    xf, xs = _quant(x)
++    return mxfp4_linear_pq_chunked(xf, xs, wc, wsc, refc, N)
++
++
++def make_row_ref(ws: torch.Tensor) -> torch.Tensor:
++    """[K/32, N] uint8 -> [N] uint8 (folded-path per-row reference exponent)."""
++    return ws.max(dim=0).values.contiguous()
++
++
++def _r4d_cfg(M, K):
++    """(WV, SK, MB, NPW) for the r4d decode GEMM, from libr4d's own bench tuning."""
++    mb = max(1, min(4, (M + 15) // 16))
++    sk = 8 if M <= 16 else 4
++    while sk > 1 and K % (sk * 32):
++        sk //= 2
++    return 2, sk, mb, 2
++
++
++def quant_act_fp8(x: torch.Tensor):
++    """Per-token e4m3 quantisation, fp32 maths, matching the reference path."""
++    amax = x.float().abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
++    sc = amax / 448.0
++    q = (x.float() / sc).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
++    return q.contiguous(), sc.view(-1).float().contiguous()
++
++
++def mxfp4_linear(x: torch.Tensor, w: torch.Tensor, ws: torch.Tensor,
++                 wref: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
++    M, K = x.shape[0], x.shape[1]
++    N = w.shape[0]
++    xf, xs = _quant(x)
++    if out is None:
++        out = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
++    stream = torch.cuda.current_stream().cuda_stream
++    r4d = _r4d()
++    if (RAD_DECODE and _DEC[2] and M <= R4D_DECODE_MAX_M and N <= DEC_MAX_N
++            and N % 16 == 0 and K % 32 == 0 and x.is_cuda):
++        # launch() routes M<=DECODE_MAX_M to the decode-tuned kernel internally
++        _e = _gp_start()
++        _ext().launch(xf.data_ptr(), w.data_ptr(), ws.data_ptr(), wref.data_ptr(),
++                      xs.data_ptr(), out.data_ptr(), M, N, K, stream)
++        _gp_end(_e, N, K)
++        return out
++    if (WPERM and r4d is not None and M <= R4D_DECODE_MAX_M
++            and N % 16 == 0 and K % 32 == 0 and x.is_cuda):
++        wv, sk, mb, npw = _r4d_cfg(M, K)
++        r4d.gemm_mxfp4a8_nt_m64(xf.data_ptr(), xs.data_ptr(), w.data_ptr(), ws.data_ptr(),
++                                wref.data_ptr(), out.data_ptr(), M, K, N, wv, sk, mb, npw,
++                                stream)
++    else:
++        _e = _gp_start()
++        _ext().launch(xf.data_ptr(), w.data_ptr(), ws.data_ptr(), wref.data_ptr(),
++                      xs.data_ptr(), out.data_ptr(), M, N, K, stream)
++        _gp_end(_e, N, K)
++    return out
++
++
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _quant_act_fp8_kernel(x_ptr, q_ptr, s_ptr, K, BLOCK_K: tl.constexpr):
++    """Per-token e4m3 quantisation in one pass over the row (row = one program)."""
++    row = tl.program_id(0)
++    base = x_ptr + row * K
++    amax = 0.0
++    for k0 in range(0, K, BLOCK_K):
++        v = tl.load(base + k0 + tl.arange(0, BLOCK_K)).to(tl.float32)
++        amax = tl.maximum(amax, tl.max(tl.abs(v)))
++    scale = tl.maximum(amax, 1e-8) / 448.0
++    tl.store(s_ptr + row, scale)
++    qbase = q_ptr + row * K
++    for k0 in range(0, K, BLOCK_K):
++        rk = k0 + tl.arange(0, BLOCK_K)
++        v = tl.load(base + rk).to(tl.float32) / scale
++        v = tl.minimum(tl.maximum(v, -448.0), 448.0)
++        tl.store(qbase + rk, v.to(tl.float8e4nv))
++
++
++def quant_act_fp8_fast(x: torch.Tensor):
++    """Same contract as quant_act_fp8, but ~10x faster than the torch version."""
++    M, K = x.shape
++    q = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
++    s = torch.empty(M, dtype=torch.float32, device=x.device)
++    _quant_act_fp8_kernel[(M,)](x.reshape(-1), q.reshape(-1), s, K, 1024, num_warps=4)
++    return q, s
+diff --git a/python/sglang/srt/hardware_backend/gpu/quantization/r4d_mxfp4_config.py b/python/sglang/srt/hardware_backend/gpu/quantization/r4d_mxfp4_config.py
+new file mode 100644
+index 0000000..17b7e41
+--- /dev/null
++++ b/python/sglang/srt/hardware_backend/gpu/quantization/r4d_mxfp4_config.py
+@@ -0,0 +1,134 @@
++"""SGLang quantisation config + dense LinearMethod for the MXFP4 RDNA4 kernel.
++
++Mixed checkpoints: this method only claims layers whose weight_scale is a uint8
++E8M0 plane (i.e. the layers nvfp4_to_mxfp4.py converted); everything else keeps
++whatever method it had (AWQ / FP8 / unquantised).
++"""
++import torch
++from torch import nn
++
++from sglang.srt.layers.quantization.base_config import (
++    LinearMethodBase,
++    QuantizationConfig,
++)
++from sglang.srt.layers.linear import LinearBase
++from sglang.srt.layers.parameter import ModelWeightParameter
++from sglang.srt.utils.common import set_weight_attrs
++
++from sglang.srt.hardware_backend.gpu.quantization import r4d_mxfp4 as M
++
++
++def _mxfp4_weight_loader(param, loaded_weight, shard_id=None, *args, **kwargs):
++    """Shape-adaptive loader.
++
++    Merged layers (qkv / gate_up) hand us one projection at a time, and SGLang derives
++    the split from the module's output_sizes; which axis that lands on depends on the
++    parameter's output_dim attribute.  Rather than assume, match the incoming chunk
++    against the parameter and place it on whichever axis it fits.
++    """
++    tgt, src = param.data, loaded_weight
++    if tuple(src.shape) == tuple(tgt.shape):
++        tgt.copy_(src)
++        return
++    _ORDER = {"q": 0, "k": 1, "v": 2, "qkv": 0, "z": 1, "b": 2, "a": 3,
++              "gate": 0, "up": 1, "gate_up": 0, "w": 0, "w1": 0, "w2": 1, "w3": 2}
++    if isinstance(shard_id, int):
++        idx = shard_id
++    else:
++        idx = _ORDER.get(str(shard_id).lower(), 0)
++    # axis 0 (rows) split?
++    if src.shape[-1] == tgt.shape[-1] and tgt.shape[0] % src.shape[0] == 0:
++        n = tgt.shape[0] // src.shape[0]
++        i = idx if idx < n else 0
++        tgt[i * src.shape[0]:(i + 1) * src.shape[0], :].copy_(src)
++        return
++    # axis 1 (columns) split?
++    if src.shape[0] == tgt.shape[0] and tgt.shape[1] % src.shape[1] == 0:
++        n = tgt.shape[1] // src.shape[1]
++        i = idx if idx < n else 0
++        tgt[:, i * src.shape[1]:(i + 1) * src.shape[1]].copy_(src)
++        return
++    # last resort: flat copy of whatever fits
++    flat = tgt.reshape(-1)
++    flat[: src.numel()].copy_(src.reshape(-1)[: flat.numel()])
++
++
++class R4DMxfp4Config(QuantizationConfig):
++    """Marker config so `--quantization r4d_mxfp4` selects the kernel."""
++
++    def __init__(self) -> None:
++        super().__init__()
++
++    def get_name(self) -> str:
++        return "r4d_mxfp4"
++
++    def get_supported_act_dtypes(self):
++        return [torch.bfloat16, torch.float16]
++
++    @classmethod
++    def get_min_capability(cls) -> int:
++        return 0
++
++    @staticmethod
++    def get_config_filenames():
++        return []
++
++    @classmethod
++    def from_config(cls, config):
++        return cls()
++
++    def get_scaled_act_names(self):
++        return []
++
++    def get_quant_method(self, layer, prefix: str):
++        if isinstance(layer, LinearBase):
++            return R4DMxfp4LinearMethod(self)
++        return None
++
++
++class R4DMxfp4LinearMethod(LinearMethodBase):
++    """weight [N, K/2] uint8 (E2M1) + weight_scale [K/32, N] uint8 (E8M0)."""
++
++    def __init__(self, quant_config: R4DMxfp4Config):
++        self.quant_config = quant_config
++
++    def create_weights(self, layer, input_size_per_partition, output_partition_sizes,
++                       input_size, output_size, params_dtype, **extra_weight_attrs):
++        out_size = sum(output_partition_sizes)
++        k = input_size_per_partition
++        w = ModelWeightParameter(
++            data=torch.empty(out_size, k // 2, dtype=torch.uint8),
++            input_dim=1, output_dim=0,
++            weight_loader=_mxfp4_weight_loader,
++        )
++        layer.register_parameter("weight", w)
++        ws = ModelWeightParameter(
++            data=torch.empty(k // 32, out_size, dtype=torch.uint8),
++            input_dim=0, output_dim=1,
++            weight_loader=_mxfp4_weight_loader,
++        )
++        layer.register_parameter("weight_scale", ws)
++
++    def process_weights_after_loading(self, layer) -> None:
++        layer.weight = nn.Parameter(layer.weight.data.contiguous(), requires_grad=False)
++        layer.weight_scale = nn.Parameter(layer.weight_scale.data.contiguous(), requires_grad=False)
++        layer.mxfp4_row_ref = M.make_row_ref(layer.weight_scale)
++        # The lm_head is 248320 wide, far past the decode kernel N cap, so it falls back to
++        # the prefill kernel: measured 226 GB/s against ~545 GB/s for N<=36864.  Split it
++        # along N at load time and use the decode kernel per piece (2 calls per step).
++        ch = M.build_chunks(layer.weight, layer.weight_scale, layer.mxfp4_row_ref)
++        if ch is not None:
++            layer.mxfp4_wc, layer.mxfp4_wsc, layer.mxfp4_refc = ch
++            print("[r4d.mxfp4] lm_head chunked N=%d -> %d x %d"
++                  % (layer.weight.shape[0], len(ch[0]), ch[0][0].shape[0]), flush=True)
++
++    def apply(self, layer, x, bias=None):
++        wc = getattr(layer, "mxfp4_wc", None)
++        if wc is not None and x.dim() == 2 and x.shape[0] <= M.R4D_DECODE_MAX_M:
++            out = M.mxfp4_linear_chunked(x, wc, layer.mxfp4_wsc, layer.mxfp4_refc,
++                                         layer.weight.shape[0])
++        else:
++            out = M.mxfp4_linear(x, layer.weight, layer.weight_scale, layer.mxfp4_row_ref)
++        if bias is not None:
++            out = out + bias
++        return out

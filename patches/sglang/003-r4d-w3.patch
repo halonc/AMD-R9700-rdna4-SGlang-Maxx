@@ -1,0 +1,289 @@
+--- 003-r4d-w3 ---
+diff --git a/python/sglang/srt/hardware_backend/gpu/quantization/r4d_w3.py b/python/sglang/srt/hardware_backend/gpu/quantization/r4d_w3.py
+new file mode 100644
+index 0000000..524f1f3
+--- /dev/null
++++ b/python/sglang/srt/hardware_backend/gpu/quantization/r4d_w3.py
+@@ -0,0 +1,282 @@
++"""paiton w3_decode.so：3-bit（g128 对称）权重直接进 AWQ path A。
++
++来源：/data/models/qwen38-w3rot-int3（overlay，只含 6 个大 site 的 3-bit 权重）。
++`in_proj_ba`（48 列）在 SGLang 里本来就是独立 bf16 模块，所以不需要 paiton 的 side 路。
++
++契约（照抄 paiton_w3_decode_adapter.py，已在主机上单层验证）：
++  repack(src_wk, 3k/32, src_sk, k/128, dst_wk, dst_sk, rows, k, stream)   # arg1/3=源, arg5/6=目标
++  wk_bytes(n, k) == n*k*3//8 ; sk_bytes(n, k) == n*(k//128)*2
++  gemv(wk, sk, x8, xs, out, ldc, M, n, k, amode, ks, P, P_bytes, cnt, cnt_n, stream)
++  gemm_chunked(..., ldc, M, n, k, CHUNK_ROWS, stream) ; prefill(..., ldc, M, n, k, stream)
++split-K 计数器自复位（同一 buffer 连调三次输出逐位相同）=> CUDA graph 可捕获。
++"""
++import ctypes as _C
++import json
++import os
++import re
++
++import torch
++
++from sglang.srt.hardware_backend.gpu.quantization import r4d_mxfp4 as _mx
++
++W3_ON = os.environ.get("SGLANG_W3", "0") == "1"
++W3_DIR = os.environ.get("SGLANG_W3_DIR", "/data/models/qwen38-w3rot-int3")
++W3_LIB = os.environ.get("SGLANG_W3_LIB", "/opt/w3/w3_decode.so")
++# M>64 走哪个入口：0 = gemm_chunked（CHUNK_ROWS 分块，稳），1 = prefill（paiton 自己标着
++# "preflight pending"）。两者都要在真机上量过才敢选。
++W3_PREFILL = os.environ.get("SGLANG_W3_PREFILL", "0") == "1"
++
++GEMV_MAX = 64
++CHUNK_ROWS = 64
++KS_MAX = 4
++
++SITES = {
++    "mlp_gate_up": {"module": "mlp.gate_up_proj", "layers": "all", "k": 5120,
++                    "parts": (("mlp.gate_proj", 17408), ("mlp.up_proj", 17408))},
++    "mlp_down": {"module": "mlp.down_proj", "layers": "all", "k": 17408,
++                 "parts": (("mlp.down_proj", 5120),)},
++    "gdn_in_proj": {"module": "linear_attn.in_proj_qkvz", "layers": "gdn", "k": 5120,
++                    "parts": (("linear_attn.in_proj_qkv", 10240), ("linear_attn.in_proj_z", 6144))},
++    "gdn_out_proj": {"module": "linear_attn.out_proj", "layers": "gdn", "k": 6144,
++                     "parts": (("linear_attn.out_proj", 5120),)},
++    "attn_qkv": {"module": "self_attn.qkv_proj", "layers": "attention", "k": 5120,
++                 "parts": (("self_attn.q_proj", 12288), ("self_attn.k_proj", 1024),
++                           ("self_attn.v_proj", 1024))},
++    "attn_o_proj": {"module": "self_attn.o_proj", "layers": "attention", "k": 6144,
++                    "parts": (("self_attn.o_proj", 5120),)},
++}
++# (lo, hi, amode, ks)：paiton 实测分派表。内核自己会校验，不匹配返回 rc=-6。
++TABLE = {
++    "mlp_gate_up": ((1, 16, 0, 1), (17, 64, 1, 1)),
++    "mlp_down": ((1, 32, 1, 1), (33, 64, 1, 2)),
++    "gdn_in_proj": ((1, 64, 1, 1),),
++    "attn_qkv": ((1, 64, 1, 1),),
++    "gdn_out_proj": ((1, 64, 1, 1),),
++    "attn_o_proj": ((1, 64, 1, 1),),
++}
++
++_V, _L, _I = _C.c_void_p, _C.c_long, _C.c_int
++_LIB = None
++_SCR = {"P": None, "cnt": None}
++_IDX = None
++_FILES = {}
++_LAYERS = None
++ROTATED = None
++STATS = {"built": 0, "skipped": 0, "gemv": 0, "chunked": 0, "prefill": 0, "rot": 0, "bytes": 0}
++
++
++def _lib():
++    global _LIB
++    if _LIB is None:
++        lib = _C.CDLL(W3_LIB)
++        for nm, at, rt in (("abi_version", [], _I), ("arch", [], _C.c_char_p),
++                           ("variant", [], _C.c_char_p), ("target_ok", [], _I),
++                           ("wk_bytes", [_I, _I], _L), ("sk_bytes", [_I, _I], _L),
++                           ("repack", [_V, _L, _V, _L, _V, _V, _I, _I, _V], _I),
++                           ("gemv", [_V, _V, _V, _V, _V, _L, _I, _I, _I, _I, _I, _V, _L, _V, _I, _V], _I),
++                           ("prefill", [_V, _V, _V, _V, _V, _L, _I, _I, _I, _V], _I),
++                           ("gemm_chunked", [_V, _V, _V, _V, _V, _L, _I, _I, _I, _I, _V], _I),
++                           ("paiton_w3_rot_quant", [_V, _V, _V, _I, _I, _I, _V], _I)):
++            fn = getattr(lib, nm if nm.startswith("paiton_w3_rot") else "paiton_w3_decode_" + nm)
++            fn.argtypes = at
++            fn.restype = rt
++        abi = lib.paiton_w3_decode_abi_version()
++        arch = (lib.paiton_w3_decode_arch() or b"").decode()
++        var = (lib.paiton_w3_decode_variant() or b"").decode()
++        if abi != 1 or arch != "gfx1201":
++            raise RuntimeError("w3 lib abi=%d arch=%s" % (abi, arch))
++        print("[r4d.w3] loaded %s abi=%d arch=%s variant=%s" % (W3_LIB, abi, arch, var), flush=True)
++        _LIB = lib
++    return _LIB
++
++
++def _index():
++    global _IDX, _LAYERS
++    if _IDX is None:
++        _IDX = json.load(open(os.path.join(W3_DIR, "w3rot-index.json")))["weight_map"]
++        man = json.load(open(os.path.join(W3_DIR, "w3rot-manifest.json")))
++        _LAYERS = {k: set(v) for k, v in (man.get("layers") or {}).items()}
++        global ROTATED
++        ROTATED = set(man.get("sites") or ())
++        print("[r4d.w3] rotated sites %s / plain %s"
++              % (sorted(ROTATED), sorted(set(SITES) - ROTATED)), flush=True)
++    return _IDX
++
++
++def _shard(name):
++    path = os.path.join(W3_DIR, _index()[name])
++    f = _FILES.get(path)
++    if f is None:
++        from safetensors import safe_open
++        f = safe_open(path, framework="pt")
++        _FILES[path] = f
++    return f
++
++
++def site_of(prefix):
++    """'...layers.12.mlp.down_proj' -> ('mlp_down', 12)。
++
++    后缀本身就区分了 site（linear_attn.out_proj 与 self_attn.o_proj 形状相同但后缀不同），
++    所以不需要层类型表；overlay 真缺某个 (site, layer) 时由 build() 查索引兜底回落到 MXFP4。
++    """
++    m = re.search(r"layers\.(\d+)\.(.+)$", str(prefix))
++    if not m:
++        return None
++    i, suffix = int(m.group(1)), m.group(2)
++    for site, spec in SITES.items():
++        if suffix == spec["module"]:
++            return site, i
++    return None
++
++
++def _rotated():
++    _index()
++    return ROTATED
++
++
++def init_scratch(device):
++    if _SCR["P"] is not None:
++        return
++    widest = max(sum(r for _, r in s["parts"]) for s in SITES.values())
++    _SCR["P"] = torch.empty(KS_MAX * GEMV_MAX * widest, dtype=torch.float32, device=device)
++    _SCR["cnt"] = torch.zeros(1024, dtype=torch.int32, device=device)
++    print("[r4d.w3] scratch partials=%.1f MB" % (_SCR["P"].numel() * 4 / 1e6), flush=True)
++
++
++def build(layer):
++    """把这个 AWQ layer 换成 3-bit。成功返回 True（AWQ 张量由调用方释放）。"""
++    prefix = getattr(layer, "r4d_prefix", None)
++    if prefix is None:
++        return False
++    s = site_of(prefix)
++    if s is None:
++        return False
++    site, i = s
++    spec = SITES[site]
++    k = spec["k"]
++    n = sum(r for _, r in spec["parts"])
++    qw = getattr(layer, "qweight", None)
++    if qw is None or tuple(qw.shape) != (k, n // 8):
++        STATS["skipped"] += 1
++        print("[r4d.w3] skip %s: qweight %s != (%d, %d)"
++              % (prefix, None if qw is None else tuple(qw.shape), k, n // 8), flush=True)
++        return False
++    lib = _lib()
++    dev = qw.device
++    wkb, skb = lib.paiton_w3_decode_wk_bytes(n, k), lib.paiton_w3_decode_sk_bytes(n, k)
++    wk = torch.empty(wkb, dtype=torch.uint8, device=dev)
++    sk = torch.empty(skb, dtype=torch.uint8, device=dev)
++    stream = torch.cuda.current_stream(dev).cuda_stream
++    r0 = 0
++    for name, rows in spec["parts"]:
++        key = "model.language_model.layers.%d.%s.weight_packed" % (i, name)
++        if key not in _index():
++            print("[r4d.w3] skip %s: overlay 没有 %s" % (prefix, key), flush=True)
++            STATS["skipped"] += 1
++            return False
++        f = _shard(key)
++        packed = f.get_tensor(key).to(dev)
++        scale = f.get_tensor(key.replace(".weight_packed", ".weight_scale")).to(dev)
++        if tuple(packed.shape) != (rows, k * 3 // 32) or tuple(scale.shape) != (rows, k // 128):
++            raise RuntimeError("w3 part %s L%d shape %s/%s" % (name, i, tuple(packed.shape),
++                                                               tuple(scale.shape)))
++        rc = lib.paiton_w3_decode_repack(
++            _C.c_void_p(packed.view(torch.uint8).data_ptr()), _L(k * 3 // 32),
++            _C.c_void_p(scale.view(torch.uint8).data_ptr()), _L(k // 128),
++            _C.c_void_p(wk.data_ptr() + r0 * k * 3 // 8), _C.c_void_p(sk.data_ptr() + r0 * (k // 128) * 2),
++            _I(rows), _I(k), _C.c_void_p(stream))
++        if rc != 0:
++            raise RuntimeError("w3 repack rc=%d (%s L%d %s)" % (rc, site, i, name))
++        del packed, scale
++        r0 += rows
++    torch.cuda.synchronize(dev)
++    layer.w3_wk = torch.nn.Parameter(wk, requires_grad=False)
++    layer.w3_sk = torch.nn.Parameter(sk, requires_grad=False)
++    layer.w3_site = site
++    layer.w3_n, layer.w3_k = n, k
++    init_scratch(dev)
++    STATS["built"] += 1
++    STATS["bytes"] += wkb + skb
++    if STATS["built"] in (1, 64, 128, 256, 384):
++        print("[r4d.w3] built %d layers (%.2f GB)" % (STATS["built"], STATS["bytes"] / 1e9), flush=True)
++    return True
++
++
++def _dispatch(site, M):
++    for lo, hi, amode, ks in TABLE[site]:
++        if lo <= M <= hi:
++            return amode, ks
++    return 1, 1
++
++
++def apply(x, layer, bias=None):
++    lib = _lib()
++    n, k, site = layer.w3_n, layer.w3_k, layer.w3_site
++    rot = site in _rotated()
++    dev = layer.w3_wk.device
++    lead = None
++    xin = None
++    if isinstance(x, tuple):
++        q, s = x
++        q = q if q.dim() == 2 else q.reshape(-1, k)
++        s = s.view(-1)
++        M = q.shape[0]
++        if rot:
++            # 融合 norm 已经量化过了：先反量化回 bf16，再交给旋转 producer
++            xin = (q.to(torch.float32) * s.reshape(-1, 1)).to(torch.bfloat16)
++    else:
++        lead = x.shape[:-1]
++        x2 = x.contiguous().reshape(-1, k)
++        if x2.shape[-1] != k:
++            raise RuntimeError("w3 K mismatch: x %d vs %d" % (x2.shape[-1], k))
++        M = x2.shape[0]
++        if rot:
++            xin = x2
++        else:
++            q, s = _mx.quant_act_fp8(x2)
++
++    out = torch.empty(M, n, dtype=torch.bfloat16, device=dev)
++    stream = torch.cuda.current_stream(dev).cuda_stream
++    if rot:
++        # manifest: "the producer of every ROTATED site emits x . R before its per-token
++        # quantisation"。权重存的是 W.R（blockdiag H128），激活不旋转就是算错。
++        # R 对称正交（H^T=H, R.R^T=I），所以 (x.R).(W.R)^T == x.W^T，残差流不用改。
++        q = torch.empty(M, k, dtype=torch.float8_e4m3fn, device=dev)
++        s = torch.empty((k // 128) * ((M + 15) // 16 * 16), dtype=torch.float32, device=dev)
++        rc = lib.paiton_w3_rot_quant(_C.c_void_p(xin.data_ptr()), _C.c_void_p(q.data_ptr()),
++                                     _C.c_void_p(s.data_ptr()), _I(M), _I(k), _I(0),
++                                     _C.c_void_p(stream))
++        if rc != 0:
++            raise RuntimeError("w3 rot_quant rc=%d (site=%s M=%d K=%d)" % (rc, site, M, k))
++        STATS["rot"] += 1
++
++    P, cnt = _SCR["P"], _SCR["cnt"]
++    if M <= GEMV_MAX:
++        amode, ks = _dispatch(site, M)
++        rc = lib.paiton_w3_decode_gemv(
++            _C.c_void_p(layer.w3_wk.data_ptr()), _C.c_void_p(layer.w3_sk.data_ptr()),
++            _C.c_void_p(q.data_ptr()), _C.c_void_p(s.data_ptr()), _C.c_void_p(out.data_ptr()),
++            _L(n), _I(M), _I(n), _I(k), _I(amode), _I(ks),
++            _C.c_void_p(P.data_ptr()), _L(P.numel() * 4),
++            _C.c_void_p(cnt.data_ptr()), _I(cnt.numel()), _C.c_void_p(stream))
++        STATS["gemv"] += 1
++        path = "gemv"
++    elif W3_PREFILL:
++        rc = lib.paiton_w3_decode_prefill(
++            _C.c_void_p(layer.w3_wk.data_ptr()), _C.c_void_p(layer.w3_sk.data_ptr()),
++            _C.c_void_p(q.data_ptr()), _C.c_void_p(s.data_ptr()), _C.c_void_p(out.data_ptr()),
++            _L(n), _I(M), _I(n), _I(k), _C.c_void_p(stream))
++        STATS["prefill"] += 1
++        path = "prefill"
++    else:
++        rc = lib.paiton_w3_decode_gemm_chunked(
++            _C.c_void_p(layer.w3_wk.data_ptr()), _C.c_void_p(layer.w3_sk.data_ptr()),
++            _C.c_void_p(q.data_ptr()), _C.c_void_p(s.data_ptr()), _C.c_void_p(out.data_ptr()),
++            _L(n), _I(M), _I(n), _I(k), _I(CHUNK_ROWS), _C.c_void_p(stream))
++        STATS["chunked"] += 1
++        path = "chunked"
++    if rc != 0:
++        raise RuntimeError("w3 %s rc=%d (site=%s M=%d N=%d K=%d)" % (path, rc, site, M, n, k))
++    if lead is not None:
++        out = out.reshape(*lead, n)
++    return out if bias is None else out + bias

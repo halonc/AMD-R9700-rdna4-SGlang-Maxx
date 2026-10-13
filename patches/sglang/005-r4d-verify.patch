@@ -1,0 +1,585 @@
+--- 005-r4d-verify ---
+diff --git a/python/sglang/srt/layers/attention/r4d_verify.py b/python/sglang/srt/layers/attention/r4d_verify.py
+new file mode 100644
+index 0000000..6f7ae79
+--- /dev/null
++++ b/python/sglang/srt/layers/attention/r4d_verify.py
+@@ -0,0 +1,578 @@
++# R4D split-KV verify attention (gfx1201-tuned, h256/gqa6/page16/fp8-KV) wired
++# into the triton backend for DFlash target-verify steps. ctypes into r4d.so;
++# the SGLang KV pool layout (separate K/V buffers, token-major slots) is served
++# by the a.v != nullptr branch of the decode kernel.
++import ctypes
++import logging
++import os
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_LIB = None
++_WARNED = set()
++
++
++def enabled():
++    return os.environ.get("SGLANG_R4D_ATTN", "1") == "1"
++
++
++class R4DArgs(ctypes.Structure):
++    _fields_ = [
++        ("q", ctypes.c_void_p),
++        ("kv", ctypes.c_void_p),
++        ("block_table", ctypes.c_void_p),
++        ("seqused_k", ctypes.c_void_p),
++        ("out", ctypes.c_void_p),
++        ("k_descale", ctypes.c_void_p),
++        ("v_descale", ctypes.c_void_p),
++        ("q_descale", ctypes.c_void_p),
++        ("scratch", ctypes.c_void_p),
++        ("num_seqs", ctypes.c_int),
++        ("q_len", ctypes.c_int),
++        ("q_heads", ctypes.c_int),
++        ("kv_heads", ctypes.c_int),
++        ("head_dim", ctypes.c_int),
++        ("block_size", ctypes.c_int),
++        ("max_blocks", ctypes.c_int),
++        ("kv_block_stride", ctypes.c_long),
++        ("kv_head_stride", ctypes.c_long),
++        ("scale", ctypes.c_float),
++        ("splits", ctypes.c_int),
++        ("max_ctx", ctypes.c_int),
++        ("v", ctypes.c_void_p),
++    ]
++
++
++def _lib():
++    global _LIB
++    if _LIB is None:
++        lib = ctypes.CDLL(os.environ.get("R4D_SO", "/opt/libr4d/r4d.so"))
++        lib.r4d_attn_decode_h256_gqa6_fp8kv.argtypes = [
++            ctypes.POINTER(R4DArgs),
++            ctypes.c_void_p,
++        ]
++        lib.r4d_attn_decode_h256_gqa6_fp8kv.restype = ctypes.c_int
++        lib.r4d_attn_decode_h256_gqa6_scratch_bytes.argtypes = [ctypes.POINTER(R4DArgs)]
++        lib.r4d_attn_decode_h256_gqa6_scratch_bytes.restype = ctypes.c_long
++        _LIB = lib
++    return _LIB
++
++
++def _scratch_bytes(a):
++    return _lib().r4d_attn_decode_h256_gqa6_scratch_bytes(ctypes.pointer(a))
++
++
++class R4DVerify:
++    """Bound to one triton attention backend instance."""
++
++    def __init__(self, backend):
++        self.backend = backend
++        self.scratch = None
++        self._prepped = False
++        self._obuf = None
++        self._dbg = 0
++        self._dumped = 0
++
++    def _prep(self, max_ctx):
++        # Pre-allocate scratch outside any graph capture at a generous bound so
++        # replay pointers stay valid for every bucket.
++        if self._prepped:
++            return
++        a = R4DArgs()
++        a.num_seqs, a.q_len, a.q_heads = 16, 10, 24
++        a.kv_heads, a.head_dim, a.block_size = 4, 256, 16
++        a.max_ctx = max(int(max_ctx), 1024)
++        a.splits = 0
++        need = max(_scratch_bytes(a), 1 << 20)
++        self.scratch = torch.empty(need, dtype=torch.uint8, device="cuda")
++        self._prepped = True
++        logger.info("R4D verify attention armed (scratch %.1f MB)", need / 1e6)
++
++    def _no(self, why):
++        if why not in _WARNED:
++            _WARNED.add(why)
++            logger.warning("r4d verify skipped: %s", why)
++        return False
++
++    def try_verify(self, layer, forward_batch, q, o, k=None, v=None):
++        b = self.backend
++        try:
++            bs = int(forward_batch.batch_size)
++            qh, kvh = int(layer.tp_q_head_num), int(layer.tp_k_head_num)
++            if qh // kvh != 6 or int(layer.qk_head_dim) != 256:
++                return self._no(f"shape qh={qh} kvh={kvh} dim={layer.qk_head_dim}")
++            if qh != 24 or kvh != 4:
++                return self._no(f"tp split qh={qh} kvh={kvh}")
++            if q.shape[0] % bs:
++                return self._no("q rows not divisible by bs")
++            q_len = q.shape[0] // bs
++            if q_len > 10 or bs > 16:
++                return self._no(f"q_len={q_len} bs={bs}")
++            kbuf = b.token_to_kv_pool.get_key_buffer(layer.layer_id)
++            vbuf = b.token_to_kv_pool.get_value_buffer(layer.layer_id)
++            _fp8 = (torch.float8_e4m3fn, getattr(torch, "float8_e4m3fnuz", None))
++            _fp8 = tuple(x for x in _fp8 if x is not None)
++            if kbuf.dtype not in _fp8 or vbuf.dtype not in _fp8:
++                return self._no(f"kv dtype {kbuf.dtype}")
++            if kbuf.dim() != 3 or vbuf.dim() != 3:
++                return self._no(f"kv dim {kbuf.dim()} shape {tuple(kbuf.shape)}")
++            # The kernel's klimit is ctx - q_len + qrow, i.e. seqused_k must be
++            # the TOTAL length including the q_len draft tokens just written to the
++            # KV pool.  forward_batch.seq_lens during DFlash verify is the PREFIX
++            # only, so it must be extended by q_len (preallocated buffers: this
++            # runs inside CUDA-graph capture).
++            md0 = b.forward_metadata
++            src = forward_batch.seq_lens
++            base = getattr(md0, "_r4d_base", None)
++            if base is None or base.shape[0] < bs or base.dtype != torch.int32:
++                base = torch.empty(max(bs, 64), dtype=torch.int32, device=src.device)
++                md0._r4d_base = base
++            ext = getattr(md0, "_r4d_ext", None)
++            if ext is None or ext.shape[0] < bs or ext.dtype != torch.int32:
++                ext = torch.empty(max(bs, 64), dtype=torch.int32, device=src.device)
++                md0._r4d_ext = ext
++            base[:bs].copy_(src[:bs])
++            torch.add(base[:bs], q_len, out=ext[:bs])
++            seq_lens = ext
++            slc = getattr(forward_batch, "seq_lens_cpu", None)
++            if slc is None:
++                return self._no("seq_lens_cpu None")
++            max_ctx = int(slc.max()) + q_len
++            if max_ctx <= 0:
++                return self._no(f"max_ctx {max_ctx}")
++            self._prep(int(b.req_to_token.shape[1]))
++            max_blocks = (max_ctx + 15) // 16
++            md = b.forward_metadata
++            # The block table must be sized for the WHOLE context, not the current
++            # max_ctx: inside a CUDA graph the tensor captured is replayed against
++            # longer sequences, and a too-narrow table makes the kernel read page
++            # indices past the end (illegal access).  Allocate once at the ctx bound
++            # and refill in place every step.
++            full_blocks = (int(b.req_to_token.shape[1]) + 15) // 16
++            bt = getattr(md, "_r4d_bt", None)
++            if bt is None or bt.shape[1] < full_blocks or bt.shape[0] < bs:
++                pos = torch.arange(full_blocks, dtype=torch.int64,
++                                   device=seq_lens.device) * 16
++                bt = torch.empty(max(bs, 64), full_blocks, dtype=torch.int32,
++                                 device=seq_lens.device)
++                md._r4d_bt = bt
++                md._r4d_pos = pos
++            bt[:bs].copy_(
++                b.req_to_token[forward_batch.req_pool_indices[:, None],
++                               md._r4d_pos[None, :]]
++            )
++            a_max_blocks = full_blocks
++            if not q.is_contiguous():
++                q = q.contiguous()
++            a = R4DArgs()
++            a.q = q.data_ptr()
++            a.kv = kbuf.data_ptr()
++            a.v = vbuf.data_ptr()
++            a.block_table = bt.data_ptr()
++            a.seqused_k = seq_lens.data_ptr()
++            rows = bs * q_len
++            need = rows * qh * 256
++            ob = self._obuf
++            if ob is None or ob.numel() < need:
++                ob = torch.empty(max(need, 16 * 10 * 24 * 256),
++                                 dtype=torch.bfloat16, device=q.device)
++                self._obuf = ob
++            ov = ob[:need].view(rows, qh, 256)
++            a.out = ov.data_ptr()
++            a.k_descale = None
++            a.v_descale = None
++            a.q_descale = None
++            ks = getattr(layer, "k_scale_float", None)
++            vs = getattr(layer, "v_scale_float", None)
++            ks = 1.0 if ks is None else float(ks)
++            vs = 1.0 if vs is None else float(vs)
++            if ks != 1.0 or vs != 1.0:
++                key = (bs, kvh)
++                dd = getattr(layer, "_r4d_descales", None)
++                if dd is None or dd[0] != key:
++                    n = bs * kvh
++                    kt = torch.full((n,), ks, dtype=torch.float32,
++                                    device=kbuf.device)
++                    vt = torch.full((n,), vs, dtype=torch.float32,
++                                    device=kbuf.device)
++                    layer._r4d_descales = (key, kt, vt)
++                    dd = layer._r4d_descales
++                a.k_descale = dd[1].data_ptr()
++                a.v_descale = dd[2].data_ptr()
++            a.scratch = self.scratch.data_ptr()
++            a.num_seqs, a.q_len, a.q_heads = bs, q_len, qh
++            a.kv_heads, a.head_dim, a.block_size = kvh, 256, 16
++            a.max_blocks = a_max_blocks
++            a.kv_block_stride = kbuf.stride(0)
++            a.kv_head_stride = kbuf.stride(1)
++            a.scale = float(layer.scaling)
++            a.splits = 0
++            # decode_splits() runs on the HOST and sizes the grid from max_ctx.
++            # Inside a CUDA graph the launch config is frozen at capture, so a
++            # capture-time dummy length would pin splits (and thus the number of
++            # CTAs) far too low for long replays: at 20K ctx the frozen splits=4
++            # left 16 CTAs for 1853 tiles and verify cost 78 ms instead of ~45.
++            # Arm the grid for the pool bound; empty segments exit immediately and
++            # the combine reads only r4d_attn_used(ctx) partials.
++            a.max_ctx = int(b.req_to_token.shape[1])
++            if os.environ.get("SGLANG_R4D_ZEROSCRATCH") == "1":
++                self.scratch.zero_()
++            dump = (os.environ.get("SGLANG_R4D_DUMP") == "1"
++                    and self._dumped < 3 and int(layer.layer_id) == 3
++                    and max_ctx > 1500)
++            if dump:
++                # o aliases q (save_output = q): capture the real input q first.
++                qpre = q.clone()
++                kdp = a.k_descale
++                vdp = a.v_descale
++                nb2 = (max_ctx + 15) // 16
++                sl16 = (bt[0, :nb2, None]
++                        + torch.arange(16, device=bt.device)[None, :]).reshape(-1)[:max_ctx]
++                sl16max = int(sl16.max().item())
++                _ro = torch.empty_like(ov)
++                _a2 = R4DArgs()
++                ctypes.memmove(ctypes.byref(_a2), ctypes.byref(a),
++                               ctypes.sizeof(R4DArgs))
++                _a2.out = _ro.data_ptr()
++                _lib().r4d_attn_decode_h256_gqa6_fp8kv(
++                    ctypes.pointer(_a2), torch.cuda.current_stream().cuda_stream)
++                torch.cuda.synchronize()
++                _rerun = _ro
++                # live replica: compact the pool around the sequence, same slots,
++                # same bt, same q -> if this matches the reference but the live
++                # call does not, the live pool content/addresses differ.
++                _mx = int(sl16max)
++                _nsl = _mx + 17
++                _kb = torch.zeros(_nsl, kvh, 256, dtype=torch.uint8, device=q.device)
++                _vb = torch.zeros(_nsl, kvh, 256, dtype=torch.uint8, device=q.device)
++                _kb[sl16] = kbuf[sl16].view(torch.uint8)
++                _vb[sl16] = vbuf[sl16].view(torch.uint8)
++                _kb = _kb.view(torch.float8_e4m3fn)
++                _vb = _vb.view(torch.float8_e4m3fn)
++                _btS = bt[:1, :nb2].contiguous()
++                _slS = seq_lens[:1].clone()
++                _oS = torch.empty_like(ov)
++                _aS = R4DArgs()
++                ctypes.memmove(ctypes.byref(_aS), ctypes.byref(a),
++                               ctypes.sizeof(R4DArgs))
++                _aS.kv = _kb.data_ptr()
++                _aS.v = _vb.data_ptr()
++                _aS.block_table = _btS.data_ptr()
++                _aS.seqused_k = _slS.data_ptr()
++                _aS.out = _oS.data_ptr()
++                _aS.kv_block_stride = _kb.stride(0)
++                _aS.kv_head_stride = _kb.stride(1)
++                _aS.max_blocks = int(_btS.shape[1])
++                _aS.scratch = torch.zeros(
++                    max(_scratch_bytes(_aS), 1 << 20), dtype=torch.uint8,
++                    device=q.device).data_ptr()
++                _rcS = _lib().r4d_attn_decode_h256_gqa6_fp8kv(
++                    ctypes.pointer(_aS), torch.cuda.current_stream().cuda_stream)
++                torch.cuda.synchronize()
++                _replica = _oS
++                _replica_rc = _rcS
++                # live Triton reference on the very same call (q must be the
++                # pre-overwrite copy: o aliases q).
++                _o2 = torch.zeros_like(ov)
++                _okT = b.verify_splitkv_fwd(
++                    qpre,
++                    k.contiguous() if k is not None else None,
++                    v.contiguous() if v is not None else None,
++                    _o2.view(-1, qh, 256),
++                    kbuf, vbuf,
++                    b.forward_metadata.qo_indptr,
++                    b.forward_metadata.kv_indptr,
++                    b.forward_metadata.kv_indices,
++                    b.forward_metadata.custom_mask,
++                    True,
++                    b.forward_metadata.mask_indptr,
++                    b.forward_metadata.max_extend_len,
++                    None, None, a.scale,
++                    logit_cap=0.0, sliding_window_size=-1,
++                    sinks=None, window_kv_offsets=None,
++                    xai_temperature_len=0,
++                    max_bs=b.req_to_token_pool.size,
++                )
++                torch.cuda.synchronize()
++                _triton = _o2
++                _triton_ok = bool(_okT)
++                _fm = b.forward_metadata
++                _kvi = getattr(_fm, 'kv_indices', None)
++                _kvin = getattr(_fm, 'kv_indptr', None)
++                _mism = -1
++                if _kvi is not None and _kvin is not None and int(_kvin[0]) == 0:
++                    _n = min(int(_kvin[1]), max_ctx)
++                    _a1 = _kvi[:_n].to(torch.int64)
++                    _b1 = sl16[:_n].to(torch.int64)
++                    _neq = (_a1 != _b1).nonzero()
++                    _mism = int(_neq[0]) if _neq.numel() else -1
++                    logger.warning(
++                        "R4DKV n=%s first_mismatch=%s triton_kv[:6]=%s r4d_sl[:6]=%s "
++                        "triton_tail=%s r4d_tail=%s",
++                        _n, _mism, _a1[:6].tolist(), _b1[:6].tolist(),
++                        _a1[-6:].tolist(), _b1[-6:].tolist())
++            rc = _lib().r4d_attn_decode_h256_gqa6_fp8kv(
++                ctypes.pointer(a), torch.cuda.current_stream().cuda_stream
++            )
++            if rc == 0:
++                o.copy_(ov)
++            if dump:
++                self._dumped += 1
++                nb = (max_ctx + 15) // 16
++                sl16 = (bt[0, :nb, None]
++                        + torch.arange(16, device=bt.device)[None, :]).reshape(-1)[:max_ctx]
++                torch.save({
++                    "q": q.cpu(), "k": kbuf[sl16].cpu(), "v": vbuf[sl16].cpu(),
++                    "bt": bt[:1, :nb].cpu(), "slots": sl16.cpu(),
++                    "ctx": max_ctx, "q_len": q_len, "qh": qh, "kvh": kvh,
++                    "scale": a.scale, "kbs": int(kbuf.stride(0)),
++                    "khs": int(kbuf.stride(1)), "o": o.cpu(), "rc": rc,
++                    "qpre": qpre.cpu(), "kdp": kdp, "vdp": vdp,
++                    "ks": ks, "vs": vs, "obuf": ov.cpu(),
++                    "btfull": bt.clone().cpu(), "arghex": ctypes.string_at(
++                        ctypes.byref(a), ctypes.sizeof(R4DArgs)).hex(),
++                    "scratchn": int(self.scratch.numel()),
++                    "full_blocks": int(full_blocks), "bs": int(bs),
++                    "rerun": _rerun.cpu(), "replica": _replica.cpu(),
++                    "replica_rc": _replica_rc, "triton": _triton.cpu(),
++                    "triton_ok": _triton_ok, "sl16": sl16.cpu(),
++                    "kv_indices": (None if _kvi is None else _kvi[:max_ctx + 8].cpu()),
++                    "kv_indptr": (None if _kvin is None else _kvin[:4].cpu()),
++                    "mism": _mism,
++                }, "/tmp/r4d_dump.pt")
++                logger.warning("R4DDUMP ctx=%s q_len=%s rc=%s slots0=%s slotmax=%s",
++                               max_ctx, q_len, rc, sl16[:4].tolist(),
++                               int(sl16.max().item()))
++            if os.environ.get("SGLANG_R4D_DBG") == "1" and self._dbg < 48 and max_ctx > 64:
++                q0 = q.clone()
++                o_rerun = torch.empty_like(o)
++                a2 = R4DArgs()
++                ctypes.memmove(
++                    ctypes.byref(a2), ctypes.byref(a), ctypes.sizeof(R4DArgs)
++                )
++                a2.out = o_rerun.data_ptr()
++                rc2 = _lib().r4d_attn_decode_h256_gqa6_fp8kv(
++                    ctypes.pointer(a2), torch.cuda.current_stream().cuda_stream
++                )
++                torch.cuda.synchronize()
++                logger.warning(
++                    "R4DRERUN layer=%s rc2=%s rerun_vs_live=%.5f",
++                    layer.layer_id, rc2,
++                    (o_rerun.float() - o.float()).abs().max().item(),
++                )
++                self._dbg += 1
++                o2 = torch.empty_like(o)
++                ok = b.verify_splitkv_fwd(
++                    q,
++                    k.contiguous() if k is not None else None,
++                    v.contiguous() if v is not None else None,
++                    o2.view(-1, a.q_heads, 256),
++                    kbuf, vbuf,
++                    b.forward_metadata.qo_indptr,
++                    b.forward_metadata.kv_indptr,
++                    b.forward_metadata.kv_indices,
++                    b.forward_metadata.custom_mask,
++                    True,
++                    b.forward_metadata.mask_indptr,
++                    b.forward_metadata.max_extend_len,
++                    None, None, a.scale,
++                    logit_cap=0.0, sliding_window_size=-1,
++                    sinks=None, window_kv_offsets=None,
++                    xai_temperature_len=0,
++                    max_bs=b.req_to_token_pool.size,
++                )
++                d = (o.float() - o2.float()).abs().max().item()
++                logger.warning(
++                    "R4DQDRIFT layer=%s qdrift=%.5f kscale=%s vscale=%s "
++                    "scaling=%s",
++                    layer.layer_id,
++                    (q.float() - q0.float()).abs().max().item(),
++                    getattr(layer, "k_scale_float", None),
++                    getattr(layer, "v_scale_float", None),
++                    getattr(layer, "scaling", None),
++                )
++                if layer.layer_id == 3:
++                    q3 = q.clone()
++                    kb3 = kbuf.clone()
++                    vb3 = vbuf.clone()
++                    bt3 = bt.clone()
++                    sl3 = seq_lens.clone()
++                    o3 = torch.empty_like(o)
++                    a3 = R4DArgs()
++                    ctypes.memmove(
++                        ctypes.byref(a3), ctypes.byref(a), ctypes.sizeof(R4DArgs)
++                    )
++                    a3.q = q3.data_ptr()
++                    a3.kv = kb3.data_ptr()
++                    a3.v = vb3.data_ptr()
++                    a3.block_table = bt3.data_ptr()
++                    a3.seqused_k = sl3.data_ptr()
++                    a3.out = o3.data_ptr()
++                    a3.kv_block_stride = kb3.stride(0)
++                    a3.kv_head_stride = kb3.stride(1)
++                    rc3 = _lib().r4d_attn_decode_h256_gqa6_fp8kv(
++                        ctypes.pointer(a3),
++                        torch.cuda.current_stream().cuda_stream,
++                    )
++                    torch.cuda.synchronize()
++                    logger.warning(
++                        "R4DCLONE rc3=%s clone_vs_live=%.5f kbuf_ptr=%s "
++                        "kb3_ptr=%s align=%s",
++                        rc3,
++                        (o3.float() - o.float()).abs().max().item(),
++                        hex(kbuf.data_ptr()), hex(kb3.data_ptr()),
++                        kbuf.data_ptr() % 64,
++                    )
++                if layer.layer_id == 3:
++                    slots = (bt[0, : (max_ctx + 15) // 16, None]
++                             + torch.arange(16, device=bt.device)[None, :]
++                             ).reshape(-1)[:max_ctx]
++                    kk = kbuf[slots].float().view(max_ctx, a.kv_heads, 1, 256) * ks
++                    vv = vbuf[slots].float().view(max_ctx, a.kv_heads, 1, 256) * vs
++                    kk = kk.expand(-1, a.kv_heads, a.q_heads // a.kv_heads, -1).reshape(
++                        max_ctx, a.q_heads, 256)
++                    vv = vv.expand(-1, a.kv_heads, a.q_heads // a.kv_heads, -1).reshape(
++                        max_ctx, a.q_heads, 256)
++                    qf = q.float()
++                    mask = torch.full((a.q_len, max_ctx), float("-inf"))
++                    for i in range(a.q_len):
++                        mask[i, : max_ctx - a.q_len + i + 1] = 0.0
++                    mask = mask.to(q.device)
++                    qv = qf.view(a.q_len, a.q_heads, 256)
++                    sc = torch.einsum("qhd,khd->hqk", qv, kk) * a.scale + mask[None]
++                    ref = torch.einsum(
++                        "hqk,khd->qhd", torch.softmax(sc, -1), vv
++                    )
++                    rn = ref.norm()
++                    torch.save(
++                        {
++                            "q": q.cpu(),
++                            "k": kbuf[slots].cpu(),
++                            "v": vbuf[slots].cpu(),
++                            "bt": bt.cpu(),
++                            "ctx": max_ctx,
++                            "q_len": a.q_len,
++                            "o": o.cpu(),
++                            "o2": o2.cpu(),
++                        },
++                        "/tmp/r4d_repro.pt",
++                    )
++                    # in-process replica of the offline repro: rebuild pool
++                    nsl = int(slots.max().item()) + 17
++                    kbS = torch.zeros(nsl, a.kv_heads, 256, device=bt.device,
++                                      dtype=kbuf.dtype)
++                    vbS = torch.zeros(nsl, a.kv_heads, 256, device=bt.device,
++                                      dtype=vbuf.dtype)
++                    kbS[slots] = kbuf[slots]
++                    vbS[slots] = vbuf[slots]
++                    qS = q.cpu().cuda()
++                    btS = bt.cpu().cuda()
++                    slS = seq_lens.cpu().cuda()
++                    oS = torch.empty_like(o)
++                    aS = R4DArgs()
++                    ctypes.memmove(
++                        ctypes.byref(aS), ctypes.byref(a), ctypes.sizeof(R4DArgs)
++                    )
++                    aS.q = qS.data_ptr()
++                    aS.kv = kbS.data_ptr()
++                    aS.v = vbS.data_ptr()
++                    aS.block_table = btS.data_ptr()
++                    aS.seqused_k = slS.data_ptr()
++                    aS.out = oS.data_ptr()
++                    aS.kv_block_stride = kbS.stride(0)
++                    aS.kv_head_stride = kbS.stride(1)
++                    rcS = _lib().r4d_attn_decode_h256_gqa6_fp8kv(
++                        ctypes.pointer(aS),
++                        torch.cuda.current_stream().cuda_stream,
++                    )
++                    torch.cuda.synchronize()
++                    logger.warning(
++                        "R4DARGS layer=%s hex=%s",
++                        layer.layer_id,
++                        ctypes.string_at(
++                            ctypes.byref(a), ctypes.sizeof(R4DArgs)
++                        ).hex(),
++                    )
++                    dd = torch.load("/tmp/r4d_repro.pt")
++                    qL = dd["q"].cuda()
++                    kL = dd["k"].cuda()
++                    vL = dd["v"].cuda()
++                    btL = dd["bt"].cuda()
++                    nsl2 = int(slots.max().item()) + 17
++                    kbL = torch.zeros(nsl2, a.kv_heads, 256, device=bt.device,
++                                      dtype=kbuf.dtype)
++                    vbL = torch.zeros(nsl2, a.kv_heads, 256, device=bt.device,
++                                      dtype=vbuf.dtype)
++                    kbL[slots] = kL
++                    vbL[slots] = vL
++                    slL = torch.tensor([max_ctx], dtype=torch.int32,
++                                       device=bt.device)
++                    oL = torch.empty_like(o)
++                    aL = R4DArgs()
++                    ctypes.memmove(
++                        ctypes.byref(aL), ctypes.byref(a), ctypes.sizeof(R4DArgs)
++                    )
++                    aL.q = qL.data_ptr()
++                    aL.kv = kbL.data_ptr()
++                    aL.v = vbL.data_ptr()
++                    aL.block_table = btL.data_ptr()
++                    aL.seqused_k = slL.data_ptr()
++                    aL.out = oL.data_ptr()
++                    aL.kv_block_stride = kbL.stride(0)
++                    aL.kv_head_stride = kbL.stride(1)
++                    rcL = _lib().r4d_attn_decode_h256_gqa6_fp8kv(
++                        ctypes.pointer(aL),
++                        torch.cuda.current_stream().cuda_stream,
++                    )
++                    torch.cuda.synchronize()
++                    logger.warning(
++                        "R4DSAVED rcL=%s saved_vs_live=%.5f kdiff=%.5f "
++                        "qdiff=%.5f",
++                        rcL,
++                        (oL.float() - o.float()).abs().max().item(),
++                        (kbL[slots].float() - kbuf[slots].float()).abs().max().item(),
++                        (qL.float() - q.float()).abs().max().item(),
++                    )
++                    logger.warning(
++                        "R4DREPLICA rcS=%s replica_vs_live=%.5f nsl=%s "
++                        "slots0=%s",
++                        rcS,
++                        (oS.float() - o.float()).abs().max().item(),
++                        nsl, slots[:4].tolist(),
++                    )
++                    logger.warning(
++                        "R4DDBG3 r4d_rel=%.4f triton_rel=%.4f |o|max=%.3f "
++                        "|ref|max=%.3f r4d_rowrel=%s",
++                        (o.view(a.q_len, a.q_heads, 256).float() - ref).norm().item()
++                        / rn.item(),
++                        (o2.view(a.q_len, a.q_heads, 256).float() - ref).norm().item()
++                        / rn.item(),
++                        o.float().abs().max().item(),
++                        ref.abs().max().item(),
++                        [
++                            round(((o.view(a.q_len, a.q_heads, 256)[i].float()
++                                    - ref[i]).norm() / ref[i].norm()).item(), 3)
++                            for i in range(a.q_len)
++                        ],
++                    )
++                logger.warning(
++                    "R4DDBG layer=%s rc=%s triton_ok=%s maxdiff=%.4f "
++                    "ctx=%s q=%s kbuf=%s strides=(%s,%s) bt0=%s",
++                    layer.layer_id, rc, ok, d, max_ctx,
++                    tuple(q.shape), tuple(kbuf.shape),
++                    a.kv_block_stride, a.kv_head_stride,
++                    bt[0, :4].tolist(),
++                )
++            if rc != 0:
++                if rc not in _WARNED:
++                    _WARNED.add(rc)
++                    logger.warning("r4d verify attention rc=%d; falling back", rc)
++                return False
++            return True
++        except Exception:
++            if "exc" not in _WARNED:
++                _WARNED.add("exc")
++                logger.exception("r4d verify attention hook failed; falling back")
++            return False

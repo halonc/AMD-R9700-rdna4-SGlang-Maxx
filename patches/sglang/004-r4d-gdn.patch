@@ -1,0 +1,359 @@
+--- 004-r4d-gdn ---
+diff --git a/python/sglang/srt/layers/attention/linear/r4d_gdn.py b/python/sglang/srt/layers/attention/linear/r4d_gdn.py
+new file mode 100644
+index 0000000..029e15f
+--- /dev/null
++++ b/python/sglang/srt/layers/attention/linear/r4d_gdn.py
+@@ -0,0 +1,352 @@
++# Phase 2 (2026-10-07): libr4d 的 GDN prefill 三件套接进 SGLang 的 GDN 层。
++#
++# 替换的是 FLA Triton 的整条 prefill 链：
++#   causal_conv1d_fn + fused_qkv_split_gdn_prefill + fused_gdn_gating   -> gdn_conv_prep
++#   chunk_scaled_dot_kkt_fwd + solve_tril                               -> gdn_kkt_solve
++#   recompute_w_u + chunk_fwd_h + chunk_fwd_o                           -> gdn_chunk_scan
++# 单元对拍（benchset/gdn_parity.py，真实形状 H=48/Hg=16/K=V=128/chunk=64）：
++#   out max|d| 7e-4~1e-3（mean 2.6e-5，bf16 容差内）、state rel 0.5%；kkt+scan 比 FLA 快 7.8-11.7x。
++#
++# kill-switch：SGLANG_R4D_GDN_MIN_T（默认 0 = 完全不走这条路）。只有 prefill 的
++# extend 分支会走；target_verify / MIS / state checkpoint / mamba track 一律留在 FLA。
++import os
++import torch
++
++_MIN_T = int(os.environ.get("SGLANG_R4D_GDN_MIN_T", "0"))
++_SOFTPLUS_THRESHOLD = 20.0  # FLA 的值，libr4d 也是按它验证的
++
++_ext_mod = None
++_load_tried = False
++_kernels = {}
++_logged = False
++
++
++def _ext():
++    global _ext_mod, _load_tried
++    if _load_tried:
++        return _ext_mod
++    _load_tried = True
++    try:
++        import sys
++
++        if "/opt/libr4d" not in sys.path:
++            sys.path.insert(0, "/opt/libr4d")
++        import r4d
++
++        _ext_mod = r4d
++        _kernels["conv_prep"] = getattr(r4d, r4d.select("gdn_conv_prep", conv_width=4, head_k=r4d.GDN_HEAD_K, head_v=r4d.GDN_HEAD_V, chunk=r4d.GDN_CHUNK))
++        _kernels["kkt"] = getattr(r4d, r4d.select("gdn_kkt_solve", head_k=r4d.GDN_HEAD_K, chunk=r4d.GDN_CHUNK))
++        _kernels["scan"] = getattr(r4d, r4d.select("gdn_chunk_scan", head_k=r4d.GDN_HEAD_K, head_v=r4d.GDN_HEAD_V, chunk=r4d.GDN_CHUNK))
++    except Exception as e:  # 库缺失或加载失败：留在 FLA
++        _ext_mod = None
++        print(f"[r4d.gdn] libr4d 不可用，GDN 融合关闭: {e!r}", flush=True)
++    return _ext_mod
++
++
++def wanted(T: int) -> bool:
++    """只有开了开关、且 token 数够大的 prefill 才走 r4d（小批量留给 FLA 的图友好路径）。"""
++    if _MIN_T <= 0 or T < _MIN_T:
++        return False
++    return _ext() is not None
++
++
++def _stream():
++    return torch.cuda.current_stream().cuda_stream
++
++
++def fused_prefill(
++    mixed_qkv, conv_w, conv_bias, conv_states, conv_cache_idx, has_initial,
++    a, b, A_log, dt_bias,
++    ssm_states, ssm_cache_idx,
++    cu_seqlens, num_seqs, T, H, Hg, K, V,
++):
++    """conv_prep -> kkt_solve -> chunk_scan。返回 bf16 [1,T,H,V]，并把终态写回 ssm_states。
++
++    调用方保证：非 target_verify、非 MIS、无 state checkpoint、无 mamba track。
++    任何不满足的几何/类型条件都直接 raise —— 宁可当场失败，不要静默算错。
++    """
++    r4d = _ext()
++    if r4d is None:
++        raise RuntimeError("r4d.gdn: libr4d 未加载")
++    HK, HV, CH = r4d.GDN_HEAD_K, r4d.GDN_HEAD_V, r4d.GDN_CHUNK
++    if K != HK or V != HV:
++        raise RuntimeError(f"r4d.gdn: 几何不符 K={K} V={V}，内核是 {HK}/{HV}")
++    if mixed_qkv.dtype != torch.bfloat16 or a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
++        raise RuntimeError(f"r4d.gdn: 输入 dtype {mixed_qkv.dtype}/{a.dtype}")
++    if num_seqs < 1 or T < 1:
++        raise RuntimeError(f"r4d.gdn: num_seqs={num_seqs} T={T}")
++    if H % Hg:
++        raise RuntimeError(f"r4d.gdn: v 头数 {H} 不是 k 头数 {Hg} 的整数倍")
++    if mixed_qkv.shape[-1] != 2 * Hg * K + H * V:
++        raise RuntimeError(f"r4d.gdn: mixed_qkv 宽 {mixed_qkv.shape[-1]} != {2 * Hg * K + H * V}")
++
++    cu = cu_seqlens if (cu_seqlens.dtype == torch.int32 and cu_seqlens.is_contiguous()) else cu_seqlens.to(torch.int32).contiguous()
++    has_init = has_initial if has_initial.dtype == torch.bool else has_initial.to(torch.bool)
++    if not has_init.is_contiguous():
++        has_init = has_init.contiguous()
++
++    dev = mixed_qkv.device
++    q = torch.empty((T, Hg, HK), device=dev, dtype=torch.bfloat16)
++    k = torch.empty((T, Hg, HK), device=dev, dtype=torch.bfloat16)
++    v = torch.empty((T, H, HV), device=dev, dtype=torch.bfloat16)
++    g = torch.empty((T, H), device=dev, dtype=torch.float32)
++    beta = torch.empty((T, H), device=dev, dtype=torch.float32)
++
++    global _logged
++    if not _logged:
++        _logged = True
++        print(
++            "[r4d.gdn] 首次调用: T=%d N=%d H=%d Hg=%d K=%d V=%d | x %s pitch=%d | conv_state %s strides=%s | ssm %s strides=%s | cu %s"
++            % (T, num_seqs, H, Hg, K, V, tuple(mixed_qkv.shape), mixed_qkv.stride(0),
++               tuple(conv_states.shape), tuple(conv_states.stride()), tuple(ssm_states.shape),
++               tuple(ssm_states.stride()), cu.dtype),
++            flush=True,
++        )
++
++    # 1) conv + qkv split + l2norm + gating + 每 chunk 的 cumsum
++    _kernels["conv_prep"](
++        mixed_qkv.data_ptr(), mixed_qkv.stride(0),
++        conv_w.data_ptr(),
++        conv_bias.data_ptr() if conv_bias is not None else 0,
++        conv_states.data_ptr(), conv_states.stride(0), conv_states.stride(1), conv_states.stride(2),
++        conv_cache_idx.data_ptr(), conv_cache_idx.stride(0),
++        has_init.data_ptr() if has_init is not None else 0,
++        a.data_ptr(), b.data_ptr(), a.stride(0), a.dtype == torch.bfloat16,
++        A_log.data_ptr(), dt_bias.data_ptr(),
++        q.data_ptr(), k.data_ptr(), v.data_ptr(), g.data_ptr(), beta.data_ptr(),
++        cu.data_ptr(), num_seqs, T, H, Hg, HK, HV, 4, _SOFTPLUS_THRESHOLD, _stream(),
++    )
++
++    # 2) A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1
++    A = torch.empty((T, H, CH), device=dev, dtype=torch.bfloat16)
++    _kernels["kkt"](
++        k.data_ptr(), beta.data_ptr(), g.data_ptr(), A.data_ptr(), cu.data_ptr(),
++        num_seqs, T, H, Hg, HK, CH, _stream(),
++    )
++
++    # 3) chunked scan。chunk_scan 没有 state 索引参数：h0 必须按序列顺序排好，
++    #    所以这里永远 gather 一份 fp32 连续副本，算完再写回池子。
++    st = ssm_states[ssm_cache_idx].to(torch.float32).contiguous()
++    if st.shape[0] < num_seqs:
++        raise RuntimeError(f"r4d.gdn: 只有 {st.shape[0]} 份 state，却有 {num_seqs} 条序列")
++    ht = torch.empty_like(st)
++    o = torch.empty((1, T, H, HV), device=dev, dtype=torch.bfloat16)
++    _kernels["scan"](
++        q.data_ptr(), k.data_ptr(), v.data_ptr(), A.data_ptr(), g.data_ptr(), beta.data_ptr(),
++        st.data_ptr(), o.data_ptr(), ht.data_ptr(), cu.data_ptr(),
++        num_seqs, H, Hg, HK, HV, CH, float(K ** -0.5), _stream(),
++    )
++    ssm_states[ssm_cache_idx] = ht.to(ssm_states.dtype)
++    return o
++
++
++# ---- Phase 2b (2026-10-07): decode 侧 conv_update + recurrent_update ------------------------
++# 替换 FLA 的 causal_conv1d_update + packed recurrent（Triton）。kill-switch：
++# SGLANG_R4D_GDN_DECODE_MIN_T（默认 0 = 不走）。这个 build 的 libr4d 没有 gdn_fused_update /
++# gdn_lazy_update，也没有 bf16/fp16 state 变体 —— select() 对 state_dtype 键是忽略的，
++# 所以 state 必须是 fp32，否则内核会按 fp32 读 16 bit 缓存而打爆队列（paiton 那边同样的坑）。
++_MIN_D = int(os.environ.get("SGLANG_R4D_GDN_DECODE_MIN_T", "0"))
++_decode_logged = False
++
++
++def decode_wanted(T: int) -> bool:
++    if _MIN_D <= 0 or T < _MIN_D:
++        return False
++    return _ext() is not None
++
++
++def fused_decode(
++    mixed_qkv, conv_w, conv_bias, conv_states, conv_cache_idx,
++    a, b, A_log, dt_bias,
++    ssm_states, ssm_cache_idx,
++    cu_seqlens, num_seqs, T, H, Hg, K, V, out_rows,
++):
++    """conv_update -> recurrent_update。返回 bf16 [1,out_rows,H,V]；状态在池子里原地更新。
++
++    decode 分支保证：每行一个 token（max_query_len=1）、无 spec 候选（num_accepted=NULL）、
++    无 ReplaySSM、无 MIS。cache_indices 里 -1 的填充行由内核自行跳过，o 的对应行保持 0。
++    """
++    r4d = _ext()
++    if r4d is None:
++        raise RuntimeError("r4d.gdn: libr4d 未加载")
++    HK, HV = r4d.GDN_HEAD_K, r4d.GDN_HEAD_V
++    if K != HK or V != HV:
++        raise RuntimeError(f"r4d.gdn: 几何不符 K={K} V={V}，内核是 {HK}/{HV}")
++    if ssm_states.dtype != torch.float32:
++        raise RuntimeError(f"r4d.gdn: decode 要原地更新 fp32 state，缓存是 {ssm_states.dtype}")
++    if mixed_qkv.dtype != torch.bfloat16 or a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
++        raise RuntimeError(f"r4d.gdn: 输入 dtype {mixed_qkv.dtype}/{a.dtype}")
++    if mixed_qkv.shape[-1] != 2 * Hg * K + H * V:
++        raise RuntimeError(f"r4d.gdn: mixed_qkv 宽 {mixed_qkv.shape[-1]} != {2 * Hg * K + H * V}")
++    if conv_states.shape[-1] != 3:
++        raise RuntimeError(f"r4d.gdn: conv 窗口槽是 {conv_states.shape[-1]}，内核按 width-1=3 写")
++
++    cu = cu_seqlens if (cu_seqlens.dtype == torch.int32 and cu_seqlens.is_contiguous()) else cu_seqlens.to(torch.int32).contiguous()
++    cidx = conv_cache_idx if conv_cache_idx.dtype == torch.int32 else conv_cache_idx.to(torch.int32)
++    sidx = ssm_cache_idx if ssm_cache_idx.dtype == torch.int32 else ssm_cache_idx.to(torch.int32)
++
++    dev = mixed_qkv.device
++    q = torch.empty((T, Hg, HK), device=dev, dtype=torch.bfloat16)
++    k = torch.empty((T, Hg, HK), device=dev, dtype=torch.bfloat16)
++    v = torch.empty((T, H, HV), device=dev, dtype=torch.bfloat16)
++    # 填充行（cache_indices=-1）内核不写，所以 o 必须自带 0
++    o = torch.zeros((out_rows, H, HV), device=dev, dtype=torch.bfloat16)
++
++    global _decode_logged
++    if not _decode_logged:
++        _decode_logged = True
++        print(
++            "[r4d.gdn] decode 首次调用: T=%d N=%d out_rows=%d H=%d Hg=%d | x %s pitch=%d | "
++            "conv_state %s strides=%s | ssm %s strides=%s dtype=%s | cidx %s | a %s stride=%d"
++            % (T, num_seqs, out_rows, H, Hg, tuple(mixed_qkv.shape), mixed_qkv.stride(0),
++               tuple(conv_states.shape), tuple(conv_states.stride()), tuple(ssm_states.shape),
++               tuple(ssm_states.stride()), ssm_states.dtype, cidx.dtype,
++               tuple(a.shape), a.stride(0)),
++            flush=True,
++        )
++
++    _kernels.setdefault("conv_update", getattr(r4d, r4d.select("gdn_conv_update", conv_width=4, head_k=HK, head_v=HV)))
++    _kernels.setdefault("recurrent", getattr(r4d, r4d.select("gdn_recurrent_update", head_k=HK, head_v=HV, state_dtype="fp32")))
++
++    _kernels["conv_update"](
++        mixed_qkv.data_ptr(), mixed_qkv.stride(0),
++        conv_w.data_ptr(),
++        conv_bias.data_ptr() if conv_bias is not None else 0,
++        conv_states.data_ptr(), conv_states.stride(0), conv_states.stride(1), conv_states.stride(2),
++        3,  # state_len_max = (width-1) + (max_query_len-1)
++        cidx.data_ptr(), cidx.stride(0),
++        0,  # num_accepted = NULL：decode 每行一个 token
++        q.data_ptr(), k.data_ptr(), v.data_ptr(),
++        cu.data_ptr(), num_seqs, H, Hg, HK, HV, 4, 1, _stream(),
++    )
++
++    _kernels["recurrent"](
++        q.data_ptr(), k.data_ptr(), v.data_ptr(),
++        a.data_ptr(), b.data_ptr(), a.stride(0), a.dtype == torch.bfloat16,
++        A_log.data_ptr(), dt_bias.data_ptr(),
++        ssm_states.data_ptr(), ssm_states.stride(0), ssm_states.stride(1),
++        o.data_ptr(), cu.data_ptr(), sidx.data_ptr(), sidx.stride(0),
++        0,  # num_accepted
++        0, 0, 0.0, 0,  # z_gate / norm 不折叠：SGLang 的 RMSNormGated 还在模型层里跑
++        num_seqs, H, Hg, HK, HV, float(K ** -0.5), _SOFTPLUS_THRESHOLD, _stream(),
++    )
++    return o.view(1, out_rows, H, HV)
++
++
++# ---- Phase 2c (2026-10-07): 链式 target_verify 也换成 conv_update + recurrent_update ----------
++# 这套 serving 里 DFlash2 每步都走 extend 的 is_target_verify（forward_decode 根本不被调用），
++# 所以 decode 两件套真正的落点是 verify。SGLang 的 verify 协议与 r4d 完全同构：
++#   conv 中间缓存（去重滑窗）物理布局 [slot, dim, draft+width-2]，候选 t 的窗口 = 列 t..t+2；
++#   r4d conv_update 写完是 [w1,w2,x0..x7]，候选 t 的窗口正好也是列 t..t+2 —— 逐位一致。
++#   FLA 的快照写在“消费掉候选 t 之后”（b_h += 之后才 store），r4d 也是写 sidx[...+t] —— 同构。
++# 唯一缺口：r4d 只有一个 state 指针，初始态必须和候选快照在同一个 slot 空间里，
++# 所以这里先把基态（conv 窗口 3 列 + ssm 一份）拷进中间缓存的第 0 列（每层 3.1 MB）。
++# kill-switch：SGLANG_R4D_GDN_VERIFY_MIN_T（默认 0 = 完全走 FLA）。
++_MIN_V = int(os.environ.get("SGLANG_R4D_GDN_VERIFY_MIN_T", "0"))
++_verify_logged = False
++
++
++def verify_wanted(T: int) -> bool:
++    if _MIN_V <= 0 or T < _MIN_V:
++        return False
++    return _ext() is not None
++
++
++def fused_verify(
++    mixed_qkv, conv_w, conv_bias, conv_states, conv_cache_idx, conv_win,
++    a, b, A_log, dt_bias,
++    temporal, inter_ssm, srow, sidx, draft,
++    cu_seqlens, num_seqs, T, H, Hg, K, V,
++):
++    """conv_update -> recurrent_update，快照写进 intermediate 缓存；基态不动。
++
++    调用方保证：链式 verify（topk=1，无 retrieve 分支）、无 ReplaySSM、intermediate 缓存已分配、
++    ssm dtype 是 fp32。commit（把被接受的快照 scatter 回 conv_states/temporal）仍由 SGLang 原路径做。
++    """
++    r4d = _ext()
++    if r4d is None:
++        raise RuntimeError("r4d.gdn: libr4d 未加载")
++    HK, HV = r4d.GDN_HEAD_K, r4d.GDN_HEAD_V
++    if K != HK or V != HV:
++        raise RuntimeError(f"r4d.gdn: 几何不符 K={K} V={V}，内核是 {HK}/{HV}")
++    if inter_ssm.dtype != torch.float32:
++        raise RuntimeError(f"r4d.gdn: verify 快照缓存要 fp32，实际 {inter_ssm.dtype}")
++    if mixed_qkv.dtype != torch.bfloat16 or a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
++        raise RuntimeError(f"r4d.gdn: 输入 dtype {mixed_qkv.dtype}/{a.dtype}")
++    if mixed_qkv.shape[0] != T or T != num_seqs * draft:
++        raise RuntimeError(f"r4d.gdn: verify 要每行 {draft} 个候选，实际 T={T} N={num_seqs}")
++    if mixed_qkv.shape[-1] != 2 * Hg * K + H * V:
++        raise RuntimeError(f"r4d.gdn: mixed_qkv 宽 {mixed_qkv.shape[-1]} != {2 * Hg * K + H * V}")
++    # 去重滑窗：物理列数 = draft + (width-1) - 1，且候选维的步长必须等于窗口列的步长（滑窗）
++    win_cols = int(conv_win.stride(2))
++    if win_cols != draft + 2:
++        raise RuntimeError(f"r4d.gdn: conv 滑窗物理列 {win_cols} != draft+2={draft + 2}")
++    if conv_win.stride(1) != conv_win.stride(3):
++        raise RuntimeError("r4d.gdn: conv 滑窗不是去重布局（候选步长 != 列步长）")
++    if conv_win.stride(3) != 1 or conv_win.dtype != torch.bfloat16:
++        raise RuntimeError(f"r4d.gdn: conv 滑窗 stride3={conv_win.stride(3)} dtype={conv_win.dtype}")
++
++    cu = cu_seqlens if (cu_seqlens.dtype == torch.int32 and cu_seqlens.is_contiguous()) else cu_seqlens.to(torch.int32).contiguous()
++    cidx = conv_cache_idx if conv_cache_idx.dtype == torch.int32 else conv_cache_idx.to(torch.int32)
++    srow = srow if srow.dtype == torch.int32 else srow.to(torch.int32)
++
++    dev = mixed_qkv.device
++    # 基态 -> 中间缓存第 0 列（r4d 读 sidx[...,0]，写完候选 0 会覆盖它，读在前写在后，安全）
++    conv_win[srow, 0, :, :] = conv_states[cidx]
++    inter_ssm[srow, 0] = temporal[cidx]
++
++    # r4d 把 slot <= 0 当 null 槽直接跳过（vLLM 的 NULL_BLOCK_ID 约定），而 SGLang 的 scratch 行号
++    # 从 0 开始：MAX_RUN=1 时 intermediate_ssm 只有 2 行，请求 0 用的就是行 0 —— 内核会整条跳过，
++    # o 留成未初始化的垃圾、快照全 0，commit 再把 0 scatter 回状态，accept 直接塌到 1。
++    # 槽号是我们给的，所以索引整体 +1（调用方传的就是 +1 后的表），指针各后退一个槽/一行：
++    # 实际访问地址完全不变，但永远不会踩到 null 检查。
++    flat_slot = int(inter_ssm.stride(2)) * H
++    state_ptr = inter_ssm.data_ptr() - flat_slot * inter_ssm.element_size()
++    cstate_ptr = conv_win.data_ptr() - conv_win.stride(0) * conv_win.element_size()
++    srow_k = srow + 1  # 内核用的槽号（+1）；srow 本身留给上面的基态拷贝
++
++    q = torch.empty((T, Hg, HK), device=dev, dtype=torch.bfloat16)
++    k = torch.empty((T, Hg, HK), device=dev, dtype=torch.bfloat16)
++    v = torch.empty((T, H, HV), device=dev, dtype=torch.bfloat16)
++    o = torch.empty((T, H, HV), device=dev, dtype=torch.bfloat16)
++
++    global _verify_logged
++    if not _verify_logged:
++        _verify_logged = True
++        print(
++            "[r4d.gdn] verify 首次调用: T=%d N=%d draft=%d H=%d Hg=%d | x %s pitch=%d | "
++            "conv_win %s strides=%s phys_cols=%d | inter_ssm %s strides=%s dtype=%s | "
++            "srow %s(+1 后) | sidx[:3] %s | a %s stride=%d"
++            % (T, num_seqs, draft, H, Hg, tuple(mixed_qkv.shape), mixed_qkv.stride(0),
++               tuple(conv_win.shape), tuple(conv_win.stride()), win_cols,
++               tuple(inter_ssm.shape), tuple(inter_ssm.stride()), inter_ssm.dtype,
++               tuple(srow.tolist()), sidx[:3].tolist(), tuple(a.shape), a.stride(0)),
++            flush=True,
++        )
++
++    _kernels.setdefault("conv_update", getattr(r4d, r4d.select("gdn_conv_update", conv_width=4, head_k=HK, head_v=HV)))
++    _kernels.setdefault("recurrent", getattr(r4d, r4d.select("gdn_recurrent_update", head_k=HK, head_v=HV, state_dtype="fp32")))
++
++    _kernels["conv_update"](
++        mixed_qkv.data_ptr(), mixed_qkv.stride(0),
++        conv_w.data_ptr(),
++        conv_bias.data_ptr() if conv_bias is not None else 0,
++        cstate_ptr, conv_win.stride(0), conv_win.stride(2), conv_win.stride(3),
++        win_cols,
++        srow_k.data_ptr(), srow_k.stride(0),
++        0,  # num_accepted = NULL：verify 阶段还不知道接受几个
++        q.data_ptr(), k.data_ptr(), v.data_ptr(),
++        cu.data_ptr(), num_seqs, H, Hg, HK, HV, 4, draft, _stream(),
++    )
++
++    _kernels["recurrent"](
++        q.data_ptr(), k.data_ptr(), v.data_ptr(),
++        a.data_ptr(), b.data_ptr(), a.stride(0), a.dtype == torch.bfloat16,
++        A_log.data_ptr(), dt_bias.data_ptr(),
++        state_ptr, flat_slot, int(inter_ssm.stride(2)),
++        o.data_ptr(), cu.data_ptr(), sidx.data_ptr(), draft,
++        0,  # num_accepted
++        0, 0, 0.0, 0,  # 不折叠 gated RMSNorm：SGLang 的 norm 还在模型层
++        num_seqs, H, Hg, HK, HV, float(K ** -0.5), _SOFTPLUS_THRESHOLD, _stream(),
++    )
++    return o.view(1, T, H, HV)

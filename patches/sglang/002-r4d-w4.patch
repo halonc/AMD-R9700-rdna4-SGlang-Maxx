@@ -1,0 +1,357 @@
+--- 002-r4d-w4 ---
+diff --git a/python/sglang/srt/hardware_backend/gpu/quantization/r4d_w4.py b/python/sglang/srt/hardware_backend/gpu/quantization/r4d_w4.py
+new file mode 100644
+index 0000000..2b35332
+--- /dev/null
++++ b/python/sglang/srt/hardware_backend/gpu/quantization/r4d_w4.py
+@@ -0,0 +1,350 @@
++"""libr4d (r4d.so) W4A16 weight repacking for the RDNA4 AWQ decode/verify path.
++
++libr4d's gemm_w4a16_nt_m64 keeps the 4-bit weights and runs them straight
++through the WMMA units, so it never materialises a bf16 weight matrix. That is
++about 20x faster than awq_dequantize + matmul for the M>1 band (speculative
++verify) and is the same "keep it 4-bit" route the native vLLM stacks take.
++
++Layouts (from libr4d's r4d_gemm_w4a16_nt_m64.hip):
++  R4D_GEMM_W4_GROUP = 128   K per (scale, zero) pair
++  R4D_GEMM_W4_KPB   = 64    K per packed block (4 k-steps of 16, 16 B/lane)
++  fragment element e of lane l = W[n0+(l&15)][16s + 8*(e>>2) + 4*(l>>4) + (e&3)]
++  dword nibble position: 2e for e<4, 2*(e-4)+1 for e>=4
++  Wq  = int32 [N//16, K//64, 32, 4]
++  Wsz = int32 [N//16, K//128, 16]  (low16 f16 scale, high16 f16(-(1024+zero)))
++
++libr4d stores the nibble as 4-bit TWOS COMPLEMENT (the kernel XORs 0x08 back to
++offset binary and pins the zero point at 8), while AWQ stores offset binary, so
++the repack XORs by 8.
++"""
++import os
++import torch
++import triton
++import triton.language as tl
++
++PACK = [0, 4, 1, 5, 2, 6, 3, 7]
++GROUP = 128
++KPB = 64
++LANES = 32
++MAX_M = 64
++CACHE_DIR = os.environ.get("SGLANG_R4D_W4_CACHE", "/data/models/qwen38-awq-r4dcache")
++
++try:  # built for gfx1201 by libr4d/build.sh
++    import r4d as _r4d
++except Exception:  # pragma: no cover
++    _r4d = None
++
++
++def available() -> bool:
++    return _r4d is not None
++
++
++def _perm() -> torch.Tensor:
++    perm = torch.zeros(LANES * 4 * 8, dtype=torch.int64)
++    for lane in range(LANES):
++        n_idx, lhi = lane & 15, lane >> 4
++        for s in range(4):
++            for e in range(8):
++                j = 8 * (e >> 2) + 4 * lhi + (e & 3)
++                pos = 2 * e if e < 4 else 2 * (e - 4) + 1
++                perm[(lane * 4 + s) * 8 + pos] = n_idx * 64 + s * 16 + j
++    return perm
++
++
++_PERM = _perm()
++_SHIFT = torch.arange(8, dtype=torch.int32) * 4
++
++
++def awq_unpack(qweight: torch.Tensor) -> torch.Tensor:
++    """AWQ qweight int32 [K, N//8] -> int8 [N, K] (values 0..15)."""
++    K, N8 = qweight.shape
++    q = torch.empty(K, N8 * 8, dtype=torch.uint8, device=qweight.device)
++    for i in range(8):
++        q[:, i::8] = ((qweight >> (PACK[i] * 4)) & 0xF).to(torch.uint8)
++    return q.t().contiguous().to(torch.int8)
++
++
++def pack_fragment(W: torch.Tensor) -> torch.Tensor:
++    """int8 [N, K] (twos complement nibbles) -> int32 [N//16, K//64, 32, 4]."""
++    N, K = W.shape
++    ntn, kbn = N // 16, K // KPB
++    src = (W.reshape(ntn, 16, kbn, KPB).permute(0, 2, 1, 3)
++           .reshape(ntn, kbn, 16 * KPB).to(torch.int32))
++    g = src[..., _PERM.to(W.device)]
++    dn = g.reshape(ntn, kbn, LANES * 4, 8)
++    # NB: torch.sum promotes integral types to int64, which would double the
++    # on-disk/VRAM size of the packed weights -- pin the accumulator dtype.
++    return (dn << _SHIFT.to(W.device)).sum(-1, dtype=torch.int32).reshape(ntn, kbn, LANES, 4)
++
++
++def pack_scales(scale_f16: torch.Tensor, zero: int = 8) -> torch.Tensor:
++    """fp16 [N, K//128] -> int32 [N//16, K//128, 16]."""
++    N, ng = scale_f16.shape
++    neg = torch.tensor(-(1024 + zero), dtype=torch.float32).to(torch.float16)
++    lo = (scale_f16.reshape(N // 16, 16, ng).permute(0, 2, 1).contiguous()
++          .view(torch.int16).to(torch.int32) & 0xFFFF)
++    hi = (neg.view(torch.int16).to(torch.int32) & 0xFFFF) << 16
++    return (lo | hi).contiguous().to(torch.int32)
++
++
++def repack(qweight: torch.Tensor, scales: torch.Tensor, chunk_n: int = 4096):
++    """AWQ tensors -> (wq, wsz) in libr4d layout.
++
++    Repacking runs on the host in chunks: it happens during model load, after
++    the KV pool is already reserved, so it must not need GPU headroom (a
++    monolithic int64 intermediate on the device OOMs a 32GB card at load).
++    """
++    dev = qweight.device
++    q = awq_unpack(qweight.detach().to("cpu"))
++    N, K = q.shape
++    parts = []
++    for n0 in range(0, N, chunk_n):
++        qc = q[n0:n0 + chunk_n]
++        parts.append(pack_fragment(((qc.to(torch.int32)) ^ 8).to(torch.int8)))
++    wq = torch.cat(parts, dim=0)
++    del parts, q
++    wsz = pack_scales(scales.detach().to("cpu").to(torch.float16).t().contiguous())
++    return wq.to(dev).contiguous(), wsz.to(dev).contiguous()
++
++
++def repack_cached(qweight, scales, prefix, device, chunk_n: int = 4096):
++    """repack(), but reusing a per-module cache so server starts stay fast.
++
++    2026-10-01: disk cache temporarily bypassed — rebuilding it inside the serving
++    start-up path stalled (3 GB written then no progress), leaving the AWQ config
++    unable to boot.  In-memory repack is the pre-cache behaviour and is slow but safe.
++    """
++    path = None
++    if prefix:
++        path = os.path.join(CACHE_DIR, prefix.replace(".", "_") + ".safetensors")
++    if path and os.path.exists(path):
++        from safetensors.torch import load_file
++        tensors = load_file(path, device="cpu")
++        return tensors["wq"].to(device).contiguous(), tensors["wsz"].to(device).contiguous()
++    wq, wsz = repack(qweight, scales, chunk_n=chunk_n)
++    if path:
++        try:
++            import shutil as _sh
++            from safetensors.torch import save_file
++            os.makedirs(CACHE_DIR, exist_ok=True)
++            if _sh.disk_usage(CACHE_DIR).free > 3 * 1024 ** 3:   # keep headroom
++                save_file({"wq": wq.cpu(), "wsz": wsz.cpu()}, path)
++        except Exception:
++            pass
++    return wq.to(device).contiguous(), wsz.to(device).contiguous()
++
++
++def _best_sk(K: int) -> int:
++    for sk in (8, 4, 2, 1):
++        if K % (sk * GROUP) == 0:
++            return sk
++    return 0
++
++
++def gemm(x_2d: torch.Tensor, wq: torch.Tensor, wsz: torch.Tensor, N: int, K: int):
++    """C[M,N] = x[M,K] @ dequant(W)[N,K]^T with the weights left in 4 bits.
++
++    M is tiled in blocks of MAX_M: the kernel is weight-bound, so a larger tile
++    reads the same 4-bit weights once, and one 64-row tile already saturates the
++    DRAM roofline, so tiling costs kernel launches rather than bandwidth.
++    """
++    M = x_2d.shape[0]
++    sk = _best_sk(K)
++    if sk == 0 or N % 16 or K % KPB:
++        return None
++    a = x_2d.contiguous().to(torch.float16)
++    c = torch.empty(M, N, dtype=torch.bfloat16, device=x_2d.device)
++    ss = torch.cuda.current_stream().cuda_stream
++    for m0 in range(0, M, MAX_M):
++        mt = min(MAX_M, M - m0)
++        _r4d.gemm_w4a16_nt_m64(
++            a[m0:].data_ptr(), wq.data_ptr(), wsz.data_ptr(), c[m0:].data_ptr(),
++            mt, K, N, 1, sk, 1, 1, 1, ss,
++        )
++    return c
++
++
++# ---- W4A8 prefill GEMM -------------------------------------------------------
++# The M<=64 libr4d kernel re-reads every weight once per 64 rows, which makes it a
++# poor fit for prefill. This kernel instead unpacks the fragment to exact int8
++# weights once per layer and runs an int8 WMMA GEMM over the whole chunk, with the
++# per-128K group scale and the per-row activation scale applied in the fp32
++# epilogue -- exactly the product the bf16 dequant path computes, at ~1.4x the
++# throughput (measured 167 vs 119 TFLOP/s on gfx1201).
++
++@triton.jit
++def _unpack_fragment_kernel(wq_ptr, out_ptr, NK, K, KBN,
++                            BLOCK: tl.constexpr):
++    """One pass: libr4d fragment dwords -> exact signed int8 [N, K].
++
++    The permutation is closed form: for (n, k) with nt = n//16, kb = k//64,
++    kk = k%64, s = kk//16, rem = kk%16, q4 = rem//4, r4 = rem%4:
++        lhi = q4 & 1, nibble position p = 2*r4 + (q4 >> 1)
++        lane = (n%16) + 16*lhi,  value = ((dword >> 4p) & 0xF) - 16 if >= 8
++    """
++    pid = tl.program_id(0)
++    idx = pid * BLOCK + tl.arange(0, BLOCK)
++    m = idx < NK
++    n = idx // K
++    k = idx % K
++    nt = n // 16
++    n_idx = n % 16
++    kb = k // 64
++    kk = k % 64
++    s = kk // 16
++    rem = kk % 16
++    q4 = rem // 4
++    r4 = rem % 4
++    lhi = q4 & 1
++    p = 2 * r4 + (q4 >> 1)
++    lane = n_idx + 16 * lhi
++    dword = tl.load(wq_ptr + ((nt * KBN + kb) * 32 + lane) * 4 + s, mask=m, other=0)
++    v = (dword >> (4 * p)) & 0xF
++    v = tl.where(v >= 8, v - 16, v)
++    tl.store(out_ptr + idx, v.to(tl.int8), mask=m)
++
++
++def unpack_fragment_fast(wq: torch.Tensor) -> torch.Tensor:
++    """Exact fragment -> int8 [N, K] in a single GPU pass (no big intermediates)."""
++    ntn, kbn = wq.shape[0], wq.shape[1]
++    N, K = ntn * 16, kbn * KPB
++    out = torch.empty(N, K, dtype=torch.int8, device=wq.device)
++    nk = N * K
++    BLOCK = 4096
++    _unpack_fragment_kernel[(triton.cdiv(nk, BLOCK),)](
++        wq.reshape(-1), out.reshape(-1), nk, K, kbn, BLOCK, num_warps=4
++    )
++    return out
++
++
++@triton.jit
++def _w4a8_gemm_kernel(a_ptr, as_ptr, w_ptr, ws_ptr, c_ptr, M, N, K,
++                      BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
++                      G: tl.constexpr):
++    pid_m, pid_n = tl.program_id(0), tl.program_id(1)
++    rm = pid_m * BM + tl.arange(0, BM)
++    rn = pid_n * BN + tl.arange(0, BN)
++    ng = K // G
++    acc = tl.zeros((BM, BN), dtype=tl.float32)
++    for g in range(0, ng):
++        accg = tl.zeros((BM, BN), dtype=tl.int32)
++        for k0 in range(g * G, (g + 1) * G, BK):
++            rk = k0 + tl.arange(0, BK)
++            a = tl.load(a_ptr + rm[:, None] * K + rk[None, :], mask=(rm[:, None] < M), other=0)
++            w = tl.load(w_ptr + rn[:, None] * K + rk[None, :])
++            accg = tl.dot(a, tl.trans(w), accg, out_dtype=tl.int32)
++        sc = tl.load(ws_ptr + rn * ng + g).to(tl.float32)
++        acc += accg.to(tl.float32) * sc[None, :]
++    am = tl.load(as_ptr + rm, mask=rm < M, other=1.0).to(tl.float32)
++    tl.store(c_ptr + rm[:, None] * N + rn[None, :],
++             (acc * am[:, None]).to(tl.bfloat16), mask=(rm[:, None] < M))
++
++
++def unpack_fragment(wq: torch.Tensor) -> torch.Tensor:
++    """libr4d fragment int32 [N//16, K//64, 32, 4] -> signed int8 [N, K] (exact)."""
++    ntn, kbn = wq.shape[0], wq.shape[1]
++    d = wq.to(torch.int64)
++    pos = torch.arange(8, device=wq.device)
++    nib = (d[..., None] >> (4 * pos)) & 0xF
++    v = nib.reshape(ntn, kbn, 2, 16, 4, 4, 2)          # lhi, n_idx, s, b, a
++    v = v.permute(0, 3, 1, 4, 6, 2, 5).contiguous()    # nt, n_idx, kb, s, a, lhi, b
++    w = v.reshape(ntn * 16, kbn * KPB).to(torch.int16)
++    return torch.where(w >= 8, w - 16, w).to(torch.int8)
++
++
++def scales_from_wsz(wsz: torch.Tensor, N: int, ng: int) -> torch.Tensor:
++    """Packed (scale, zero) dwords -> fp32 per-(output row, K group) scales."""
++    lo = wsz.view(torch.int16)[..., 0::2].contiguous().view(torch.float16)
++    return lo.permute(0, 2, 1).contiguous().view(N, ng).to(torch.float32)
++
++
++def quant_act_i8(x: torch.Tensor):
++    amax = x.abs().amax(dim=1, keepdim=True).clamp_(min=1e-8)
++    scale = amax / 127.0
++    return (x / scale).round_().clamp_(-127, 127).to(torch.int8), scale.squeeze(1)
++
++
++def w4a8_gemm(x_2d: torch.Tensor, wq: torch.Tensor, wsz: torch.Tensor, N: int, K: int,
++              group: int = GROUP):
++    """Exact W4A8 GEMM for the prefill band, consuming the libr4d fragment."""
++    if N % 16 or K % group:
++        return None
++    w_i8 = unpack_fragment_fast2(wq)   # 2.6x faster block-local unpack
++    wsc = scales_from_wsz(wsz, N, K // group)
++    a_i8, asc = quant_act_i8_fast(x_2d)   # 9.4x faster single-pass activation quant
++    M = a_i8.shape[0]
++    out = torch.empty(M, N, dtype=torch.bfloat16, device=x_2d.device)
++    BM, BN, BK = 128, 128, 64
++    grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
++    _w4a8_gemm_kernel[grid](a_i8, asc, w_i8, wsc, out, M, N, K, BM, BN, BK, group,
++                            num_warps=8, num_stages=3)
++    return out
++
++
++@triton.jit
++def _unpack_fragment_kernel_v2(wq_ptr, out_ptr, K, KBN, BLOCK: tl.constexpr):
++    """Block-local unpack: one program per (n_tile, k_block).
++
++    Replaces the flat gather (which spent ~7 div/mods per element, K=5120 being
++    not a power of two) with a [16, 64] tile whose indices are all powers-of-two
++    arithmetic, one L1-resident gather for the 128 dwords and a fully coalesced
++    store.
++    """
++    pid = tl.program_id(0)
++    nt = pid // KBN
++    kb = pid % KBN
++    n_idx = tl.arange(0, 16)[:, None]
++    kw = tl.arange(0, 64)[None, :]
++    s = kw // 16
++    rem = kw % 16
++    q4 = rem // 4
++    r4 = rem % 4
++    lhi = q4 & 1
++    p = 2 * r4 + (q4 >> 1)
++    lane = n_idx + 16 * lhi
++    dword = tl.load(wq_ptr + ((nt * KBN + kb) * 32 + lane) * 4 + s)
++    v = (dword >> (4 * p)) & 0xF
++    v = tl.where(v >= 8, v - 16, v)
++    tl.store(out_ptr + (nt * 16 + n_idx) * K + (kb * 64 + kw), v.to(tl.int8))
++
++
++def unpack_fragment_fast2(wq: torch.Tensor) -> torch.Tensor:
++    """Same result as unpack_fragment_fast, one program per 16x64 weight block."""
++    ntn, kbn = wq.shape[0], wq.shape[1]
++    N, K = ntn * 16, kbn * KPB
++    out = torch.empty(N, K, dtype=torch.int8, device=wq.device)
++    _unpack_fragment_kernel_v2[(ntn * kbn,)](wq.reshape(-1), out.reshape(-1), K, kbn, 1024, num_warps=4)
++    return out
++
++
++@triton.jit
++def _quant_act_i8_kernel(x_ptr, q_ptr, s_ptr, K, BLOCK_K: tl.constexpr):
++    """Per-row symmetric int8 quantisation in one pass over the row (row = one program).
++
++    The torch version did amax -> divide -> round -> clamp, i.e. three to four full
++    passes plus a full-size temporary; here the row is read twice and written once.
++    """
++    row = tl.program_id(0)
++    base = x_ptr + row * K
++    amax = 0.0
++    for k0 in range(0, K, BLOCK_K):
++        v = tl.load(base + k0 + tl.arange(0, BLOCK_K)).to(tl.float32)
++        amax = tl.maximum(amax, tl.max(tl.abs(v)))
++    scale = tl.maximum(amax, 1e-8) / 127.0
++    tl.store(s_ptr + row, scale)
++    qbase = q_ptr + row * K
++    for k0 in range(0, K, BLOCK_K):
++        rk = k0 + tl.arange(0, BLOCK_K)
++        v = tl.load(base + rk).to(tl.float32) / scale
++        q = tl.where(v >= 0, tl.floor(v + 0.5), -tl.floor(-v + 0.5))
++        q = tl.minimum(tl.maximum(q, -127.0), 127.0)
++        tl.store(qbase + rk, q.to(tl.int8))
++
++
++def quant_act_i8_fast(x: torch.Tensor):
++    """Same contract as quant_act_i8, one fused pass (validated bit-identical)."""
++    M, K = x.shape
++    q = torch.empty(M, K, dtype=torch.int8, device=x.device)
++    s = torch.empty(M, dtype=torch.float32, device=x.device)
++    _quant_act_i8_kernel[(M,)](x.reshape(-1), q.reshape(-1), s, K, 1024, num_warps=4)
++    return q, s
